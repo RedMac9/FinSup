@@ -50,7 +50,7 @@ chown -R finsup:finsup /opt/finsup
 # Virtualenv + zależności
 python3 -m venv /opt/finsup/venv
 /opt/finsup/venv/bin/pip install --upgrade pip
-/opt/finsup/venv/bin/pip install -r /opt/finsup/FinRep2/requirements.txt
+/opt/finsup/venv/bin/pip install -r /opt/finsup/requirements.txt
 ```
 
 > Uwaga: `psycopg2` może wymagać kompilacji. Jeśli `pip install` na nim padnie,
@@ -65,16 +65,16 @@ Pliki `secrets.env` i `secrets/*.json` są w `.gitignore`, więc wgraj je ręczn
 Z lokalnego komputera (PowerShell / scp), do katalogu `FinRep2/` na serwerze:
 
 ```bash
-scp FinRep2/secrets.env        root@srv36.mikr.us:/opt/finsup/FinRep2/secrets.env
-scp -r FinRep2/secrets          root@srv36.mikr.us:/opt/finsup/FinRep2/secrets
+scp secrets.env        root@srv36.mikr.us:/opt/finsup/secrets.env
+scp -r secrets          root@srv36.mikr.us:/opt/finsup/secrets
 ```
 
 Na serwerze ustaw właściciela i restrykcyjne uprawnienia:
 
 ```bash
-chown -R finsup:finsup /opt/finsup/FinRep2/secrets.env /opt/finsup/FinRep2/secrets
-chmod 600 /opt/finsup/FinRep2/secrets.env
-chmod 600 /opt/finsup/FinRep2/secrets/*.json
+chown -R finsup:finsup /opt/finsup/secrets.env /opt/finsup/secrets
+chmod 600 /opt/finsup/secrets.env
+chmod 600 /opt/finsup/secrets/*.json
 ```
 
 Upewnij się, że `secrets.env` zawiera (inaczej aplikacja nie wstanie):
@@ -85,11 +85,11 @@ Upewnij się, że `secrets.env` zawiera (inaczej aplikacja nie wstanie):
 Wygeneruj hash i wklej go jako `APP_PASSWORD` w `secrets.env`:
 
 ```bash
-/opt/finsup/venv/bin/python /opt/finsup/FinRep2/app/hash_password.py
+/opt/finsup/venv/bin/python /opt/finsup/app/hash_password.py
 # Podaj hasło dwukrotnie. Skopiuj całą linię, np.:
 #   APP_PASSWORD=scrypt:32768:8:1$....
 # i podmień nią APP_PASSWORD w secrets.env
-nano /opt/finsup/FinRep2/secrets.env
+nano /opt/finsup/secrets.env
 ```
 
 `verify_password()` w `flask_app.py` automatycznie wykrywa hash, więc żadne
@@ -106,7 +106,7 @@ Wskazówka na `APP_SECRET_KEY` (jeśli jeszcze go nie masz, wygeneruj losowy):
 ## Etap 4 — Usługa systemd
 
 ```bash
-cp /opt/finsup/FinRep2/deploy/finsup.service /etc/systemd/system/finsup.service
+cp /opt/finsup/deploy/finsup.service /etc/systemd/system/finsup.service
 systemctl daemon-reload
 systemctl enable --now finsup
 
@@ -203,7 +203,7 @@ które i tak już działa.
 
 ```bash
 cd /opt/finsup && git pull
-/opt/finsup/venv/bin/pip install -r FinRep2/requirements.txt   # gdy zmienią się zależności
+/opt/finsup/venv/bin/pip install -r /opt/finsup/requirements.txt   # gdy zmienią się zależności
 systemctl restart finsup
 ```
 

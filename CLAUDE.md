@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-All commands must be run from `FinRep2/` with the virtual environment activated.
+All commands must be run from the repo root (`FinSup/`) with the virtual environment activated.
 
 ```bash
 # Activate virtualenv (Windows)

@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=finsup
 Group=finsup
-WorkingDirectory=/opt/finsup/FinRep2
+WorkingDirectory=/opt/finsup
 # Production: app sits behind the Cytrus HTTPS proxy, so the session cookie
 # must stay Secure. ProxyFix in flask_app.py reads the forwarded headers.
 Environment=FLASK_SESSION_SECURE=1
