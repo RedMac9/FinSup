@@ -115,6 +115,15 @@ systemctl status finsup
 journalctl -u finsup -f
 ```
 
+Po starcie usługi nadaj użytkownikowi `finsup` własność całego katalogu
+(git clone tworzy pliki jako root, co blokuje zapis `auth_log.csv` i innych
+plików runtime tworzonych przez aplikację):
+
+```bash
+chown -R finsup:finsup /opt/finsup
+systemctl restart finsup
+```
+
 Test lokalny na serwerze (przed Cytrusem):
 
 ```bash

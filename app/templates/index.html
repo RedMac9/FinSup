@@ -262,9 +262,11 @@
                         <h3>{{ proc.name }}</h3>
                         <p>{{ proc.description }}</p>
                     </div>
-                    <a href="{{ url_for('run_proc', procedure_id=proc.id) }}" class="btn btn-run">
-                        <i class="fa-solid fa-play"></i> Execute
-                    </a>
+                    <form method="POST" action="{{ url_for('run_proc', procedure_id=proc.id) }}">
+                        <button type="submit" class="btn btn-run">
+                            <i class="fa-solid fa-play"></i> Execute
+                        </button>
+                    </form>
                 </div>
                 {% endfor %}
             </div>

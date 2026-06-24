@@ -121,10 +121,15 @@ def require_login():
     if not session.get('logged_in'):
         return redirect(url_for('login', next=request.path))
 
+def _safe_next(next_url):
+    if next_url and next_url.startswith('/') and not next_url.startswith('//'):
+        return next_url
+    return url_for('index')
+
 @app.route('/login', methods=['GET', 'POST'])
 @limiter.limit("10 per minute; 50 per hour", methods=["POST"])
 def login():
-    next_url = request.args.get('next') or request.form.get('next') or url_for('index')
+    next_url = _safe_next(request.args.get('next') or request.form.get('next'))
     if request.method == 'POST':
         username = request.form.get('username')
         password = request.form.get('password')
@@ -138,7 +143,7 @@ def login():
             log_auth_attempt('FAILURE', username or '')
             flash("Invalid username or password.")
             return render_template('login.html', next_url=next_url)
-            
+
     return render_template('login.html', next_url=next_url)
 
 @app.route('/logout')
@@ -199,10 +204,12 @@ def index():
     
     return render_template('index.html', procedures=procedures, dash_tools=dash_tools)
 
-@app.route('/run/<procedure_id>')
+ALLOWED_PROCEDURES = {"1", "2", "4", "9", "12", "14"}
+
+@app.route('/run/<procedure_id>', methods=['POST'])
 def run_proc(procedure_id):
-    # Run in a separate thread to avoid blocking the UI
-    # Note: For real production, use a task queue like Celery.
+    if procedure_id not in ALLOWED_PROCEDURES:
+        return "Not found", 404
     thread = threading.Thread(target=run_procedure, args=(procedure_id,))
     thread.start()
     flash(f"Procedure {procedure_id} started in the background.")
