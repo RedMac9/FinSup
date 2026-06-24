@@ -1,0 +1,30 @@
+[Unit]
+Description=FinSup2 Flask app (Gunicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=finsup
+Group=finsup
+WorkingDirectory=/opt/finsup/FinRep2
+# Production: app sits behind the Cytrus HTTPS proxy, so the session cookie
+# must stay Secure. ProxyFix in flask_app.py reads the forwarded headers.
+Environment=FLASK_SESSION_SECURE=1
+# Single worker is required: run_procedure uses background threads and logs
+# are kept in an in-memory buffer (LogCapture) that workers cannot share.
+ExecStart=/opt/finsup/venv/bin/gunicorn \
+    --workers 1 \
+    --threads 3 \
+    --timeout 120 \
+    --bind 0.0.0.0:20321 \
+    wsgi:app
+Restart=on-failure
+RestartSec=5
+
+# --- Hardening ---
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

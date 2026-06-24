@@ -1,0 +1,79 @@
+4. Użyj alternatywnego podejścia do pobierania danych
+
+Zamiast używać metody .history() na pojedynczym tickerze, możesz spróbować pobrać dane dla wielu tickerów jednocześnie:
+
+python
+# Zamiast pobierać dane pojedynczo
+tickers_data = yf.download(tickers, period='3mo')
+# Jeśli masz wiele tickerów, dane będą w MultiIndex DataFrame
+
+Using an iterative approach: If a recursive approach is causing a recursion error, it may be possible to use an iterative approach instead e.g. a for or while loop. This can reduce the risk of hitting the maximum recursion depth, and in some cases can also lead to more efficient and easier to understand code. 
+sys.setrecursionlimit(n)
+
+structure
+
+Recommended Project Structure
+
+Here’s a standard structure for your project:
+
+text
+FinSup/
+├── app/                        # Main application logic
+│   ├── __init__.py             # Marks the directory as a Python package
+│   ├── main.py                 # Entry point for the application
+│   ├── api/                    # API-related code (e.g., routers, endpoints)
+│   │   ├── __init__.py
+│   │   ├── stocks.py           # Functions for fetching stock data
+│   │   ├── portfolio.py        # Functions for portfolio management
+│   │   └── users.py            # User-related functionality
+│   ├── core/                   # Core settings and configurations
+│   │   ├── __init__.py
+│   │   ├── config.py           # Configuration settings (e.g., API keys, DB settings)
+│   │   └── security.py         # Authentication and authorization utilities
+│   ├── crud/                   # Database interactions (CRUD operations)
+│   │   ├── __init__.py
+│   │   ├── crud_portfolio.py   # Portfolio CRUD operations
+│   │   └── crud_users.py       # User CRUD operations
+│   ├── schemas/                # Pydantic models for validation and serialization
+│   │   ├── __init__.py
+│   │   ├── stock_schema.py     # Validation models for stock data
+│   │   └── user_schema.py      # Validation models for user data
+│   └── services/               # Business logic and calculations
+│       ├── __init__.py
+│       ├── analytics.py        # Stock analysis and risk calculations
+│       └── notifications.py    # Notification services (e.g., email/SMS alerts)
+├── tests/                      # Unit and integration tests
+│   ├── test_main.py            # Tests for the main application logic
+│   └── test_api.py             # Tests for API endpoints
+├── data/                       # Data files (e.g., CSVs, logs)
+├── docs/                       # Documentation files (e.g., README, API docs)
+├── requirements.txt            # List of dependencies
+├── setup.py                    # Package setup file (if distributing as a library)
+└── README.md                   # Project overview and instructions
+
+Explanation of Each Directory
+1. app/
+
+This is the core directory that houses all your application logic:
+
+    main.py: The entry point of your application. It initializes the app and ties together all modules.
+
+    api/: Contains modules related to API endpoints or routes.
+
+    core/: Includes configuration files (e.g., database credentials, API keys) and security-related utilities.
+
+    crud/: Handles Create, Read, Update, Delete operations for database interactions.
+
+    schemas/: Pydantic models for request validation and response serialization.
+
+    services/: Contains business logic, such as stock analysis algorithms or notification systems.
+
+2. tests/
+
+Contains unit tests to ensure each module works correctly. You can use pytest or unittest.
+3. data/
+
+A centralized location for storing data files such as sample stock data, logs, or configuration files.
+4. docs/
+
+Documentation files explaining how to use the application. Include a README file with setup instructions.

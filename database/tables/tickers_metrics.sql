@@ -1,0 +1,23 @@
+CREATE TABLE tickers_metrics (
+    "ticker" VARCHAR(20) NOT NULL,
+    "date" DATE NOT NULL,
+    "close" DECIMAL(18, 8),
+    "pct_diff_ath10" DECIMAL(18, 8),
+    "pct_diff_ath30" DECIMAL(18, 8),
+    "DaysCloseAboveSMA10_Last30_" INTEGER,
+    "DaysCloseAboveEMA10_Last30_" INTEGER,
+    "DaysCloseAboveSMA20_Last30_" INTEGER,
+    "DaysCloseAboveEMA20_Last30_" INTEGER,
+    "DaysCloseAboveEMA32_Last30_" INTEGER,
+    "DaysCloseAboveSMA50_Last30_" INTEGER,
+    "DaysCloseAboveEMA50_Last30_" INTEGER,
+    "DaysCloseAboveSMA100_Last30_" INTEGER,
+    "DaysCloseAboveEMA100_Last30_" INTEGER,
+    "DaysCloseAboveDMA25x5_Last30_" INTEGER,
+    "market" VARCHAR(20),
+    "market_real" VARCHAR(20),
+    "tradingview_url" TEXT,
+    "pct_change_last" DECIMAL(18, 8),
+    "last_updated" TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY ("ticker", "date")
+);

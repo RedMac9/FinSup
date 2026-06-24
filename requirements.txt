@@ -1,0 +1,28 @@
+# pip install -r requirements.txt
+
+yfinance
+numpy==1.26.4
+pandas==2.0.3
+openpyxl
+get-all-tickers
+yahoo_fin
+requests_html
+lxml_html_clean
+pushbullet.py
+#
+google-auth
+google-auth-oauthlib
+google-api-python-client
+plotly
+dash
+dash-bootstrap-components
+flask
+flask-limiter
+gunicorn
+#gspread
+gspread-dataframe 
+psycopg2
+sqlalchemy
+dotenv
+#perplexityai # verify if still in use
+#google-genai (no longer used)

@@ -1,0 +1,28 @@
+#local files
+credentials.json
+token.json
+FinSup.code-workspace
+
+
+#Ignore all xlsx files
+*.xlsx
+*.csv
+
+#Virtual Environment Folder Wildcard for Various Naming Conventions:
+*venv/
+.venv/
+
+#Other Common Python Files
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+#Auth log (contains IPs and user agents)
+auth_log.csv
+
+#Environment Variables and Secrets
+secrets.env
+secrets.env
+.env
+*secrets/
