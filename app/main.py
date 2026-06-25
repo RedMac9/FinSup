@@ -6,6 +6,7 @@ from services.market_metrics import metrics_separate_tabs
 from services.market_config  import market_mappings 
 from output.graph import graph_start
 from output.trade_txn_editor import trade_txn_editor_start
+from output.positions_chart import positions_chart_start
 from services.daily_pushbullet  import send_push_notification 
 from services.exchange_rate import run_exchange_rate_update
 from services.database_service import save_metrics_to_db, get_open_positions_metrics, get_roi_summary
@@ -72,7 +73,9 @@ def run_procedure(procedure_choice):
         gsheet_update_db_roi(roi_summary, creds)
     elif procedure_choice == "15":
         trade_txn_editor_start()
-    else:       
+    elif procedure_choice == "16":
+        positions_chart_start()
+    else:
         print("Invalid choice.")
 
 def main():
@@ -92,6 +95,7 @@ def main():
         print("13. graph ETF")
         print("14. exchange rates")
         print("15. trade txn editor")
+        print("16. open positions chart")
         procedure_choice = input("Enter the procedure number: ")
 
     run_procedure(procedure_choice)

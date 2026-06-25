@@ -258,8 +258,46 @@ def payloadPROD_db():
         if conn:
             conn.close()
             print("Database connection closed.")
-    
+
     return tickers
+
+
+def payload_reit_db():
+    """Return the set of open-position tickers flagged as REIT.
+
+    Joins v_open_positions (transformed ticker form, matching the CSV/sidebar)
+    with blacklisted_tickers where reason = 'REIT'.
+    """
+    reits = set()
+    conn = None
+    db_schema = os.environ.get("DB_SCHEMA")
+    if not db_schema:
+        print("Database error: DB_SCHEMA environment variable not set.")
+        return reits
+
+    try:
+        conn = psycopg2.connect(
+            host=os.environ.get("DB_HOST"),
+            database=os.environ.get("DB_NAME"),
+            user=os.environ.get("DB_USER"),
+            password=os.environ.get("DB_PASSWORD"),
+        )
+        with conn.cursor() as cur:
+            query = sql.SQL(
+                "SELECT op.ticker FROM {schema}.v_open_positions op "
+                "JOIN {schema}.blacklisted_tickers bt ON op.ticker_org = bt.ticker "
+                "WHERE bt.reason = 'REIT';"
+            ).format(schema=sql.Identifier(db_schema))
+            cur.execute(query)
+            reits = {row[0] for row in cur.fetchall()}
+            print(f"Successfully fetched {len(reits)} REIT tickers from the database.")
+    except psycopg2.Error as error:
+        print(f"Database error while fetching REIT tickers: {error}")
+    finally:
+        if conn:
+            conn.close()
+
+    return reits
 
 # Hardcoded ETF Ticker Lists
 

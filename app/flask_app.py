@@ -15,6 +15,7 @@ import threading
 from main import run_procedure
 from output.graph import graph_start
 from output.trade_txn_editor import trade_txn_editor_start
+from output.positions_chart import positions_chart_start
 from tickers_lists.ticker_groups import default_filter_graph
 
 # Load environment variables from secrets.env located in the app root (FinRep2)
@@ -182,6 +183,7 @@ for choice in graph_choices:
     graph_start(choice, default_filter_graph(None), server=app)
 
 trade_txn_editor_start(server=app)
+positions_chart_start(server=app)
 
 @app.route('/')
 def index():
@@ -200,6 +202,7 @@ def index():
         {"id": "7", "name": "Graph PROD", "url": "/graph/7/"},
         {"id": "13", "name": "Graph ETF", "url": "/graph/13/"},
         {"id": "15", "name": "Trade Txn Editor", "url": "/trade_txn_editor/"},
+        {"id": "16", "name": "Open Positions Chart", "url": "/positions_chart/"},
     ]
     
     return render_template('index.html', procedures=procedures, dash_tools=dash_tools)

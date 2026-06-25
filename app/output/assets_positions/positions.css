@@ -1,0 +1,310 @@
+/* Layout for the open-positions TradingView-style chart module. */
+
+html, body {
+    height: 100%;
+    overflow: hidden;
+}
+
+body {
+    font-family: 'Inter', system-ui, sans-serif;
+    margin: 0;
+    background: #f8fafc;
+    color: #1e293b;
+}
+
+/* Shell: collapsible sidebar | main column. */
+.pos-shell {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    height: 100vh;
+    min-height: 0;
+}
+
+/* --- Sidebar: all tickers + daily % change ----------------------------- */
+.pos-sidebar {
+    width: 230px;
+    overflow-y: auto;
+    background: #ffffff;
+    border-right: 1px solid #e2e8f0;
+    transition: width 0.2s ease, padding 0.2s ease;
+}
+
+.pos-sidebar.collapsed {
+    width: 0;
+    border-right: none;
+    overflow: hidden;
+}
+
+.pos-sidebar-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 12px 8px 16px;
+    position: sticky;
+    top: 0;
+    background: #ffffff;
+    border-bottom: 1px solid #f1f5f9;
+}
+
+.pos-sidebar-title {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #64748b;
+    font-weight: 700;
+}
+
+.pos-sidebar-actions { display: flex; gap: 6px; }
+
+.pos-ticker-list label {
+    display: block;
+    padding: 6px 16px;
+    cursor: pointer;
+    font-size: 0.85rem;
+}
+
+.pos-ticker-list label:hover {
+    background: #f1f5f9;
+}
+
+.pos-ticker-list input {
+    margin-right: 8px;
+    accent-color: #2563eb;
+    vertical-align: middle;
+}
+
+.pos-tk-row {
+    display: inline-flex;
+    justify-content: space-between;
+    align-items: center;
+    width: calc(100% - 24px);
+}
+
+.pos-tk-left { display: inline-flex; align-items: center; gap: 6px; }
+.pos-tk-sym { font-weight: 600; }
+.pos-tk-chg { font-variant-numeric: tabular-nums; font-size: 0.8rem; }
+
+.pos-tk-reit {
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    color: #7c3aed;
+    background: #ede9fe;
+    border: 1px solid #ddd6fe;
+    border-radius: 4px;
+    padding: 0 4px;
+    line-height: 1.4;
+}
+
+/* "Disregard REITs" toggle in the sidebar. */
+.pos-hide-reit {
+    padding: 4px 16px 8px;
+}
+.pos-hide-reit label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.78rem;
+    color: #475569;
+    cursor: pointer;
+}
+.pos-hide-reit input { accent-color: #7c3aed; }
+
+/* --- Main column ------------------------------------------------------- */
+.pos-main {
+    display: grid;
+    grid-template-rows: auto 1fr;
+    min-width: 0;
+    min-height: 0;
+}
+
+.pos-topbar {
+    display: flex;
+    align-items: center;
+    gap: 22px;
+    padding: 12px 24px;
+    background: #ffffff;
+    border-bottom: 1px solid #e2e8f0;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+    flex-wrap: wrap;
+}
+
+.pos-title {
+    font-size: 1.1rem;
+    font-weight: 800;
+    color: #2563eb;
+    margin: 0;
+    white-space: nowrap;
+}
+
+.pos-icon-btn {
+    border: 1px solid #cbd5e1;
+    background: #f8fafc;
+    border-radius: 8px;
+    width: 36px;
+    height: 36px;
+    font-size: 1rem;
+    cursor: pointer;
+    color: #334155;
+}
+
+.pos-icon-btn:hover { background: #e2e8f0; }
+
+.pos-control {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.pos-label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #64748b;
+    font-weight: 600;
+}
+
+.pos-label-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.pos-mini-btn {
+    border: 1px solid #cbd5e1;
+    background: #f1f5f9;
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-size: 0.7rem;
+    cursor: pointer;
+    color: #334155;
+}
+
+.pos-mini-btn:hover { background: #e2e8f0; }
+
+/* Chart-type radio inline. */
+.pos-radio { display: flex; gap: 12px; }
+.pos-radio label {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.85rem;
+    cursor: pointer;
+}
+.pos-radio input { accent-color: #2563eb; }
+
+.pos-indicators { flex: 1; min-width: 280px; }
+
+/* Render the indicator checklist as inline chips. */
+.pos-indicators .pos-checklist label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-right: 12px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    background: #f1f5f9;
+    font-size: 0.8rem;
+    cursor: pointer;
+}
+
+.pos-indicators .pos-checklist input { accent-color: #2563eb; }
+
+/* Candles toggle sits among the indicator chips but reads as the price mode. */
+.pos-indicators .pos-candles label {
+    background: #e6f5f3;
+    color: #0f766e;
+    font-weight: 600;
+}
+.pos-indicators .pos-candles input { accent-color: #0d9488; }
+
+.pos-refresh-btn {
+    padding: 8px 14px;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    background: #2563eb;
+    color: #ffffff;
+    font-weight: 600;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+
+.pos-refresh-btn:hover { background: #1d4ed8; }
+
+.pos-status {
+    font-size: 0.75rem;
+    color: #64748b;
+    white-space: nowrap;
+    align-self: center;
+}
+
+/* Fixed-size, overflow-clipped wrapper: the chart fills it absolutely so its
+   own canvas can never push the container wider (which caused the creep). */
+.pos-chart-wrap {
+    position: relative;
+    overflow: hidden;
+    margin: 16px 24px 24px;
+    min-width: 0;
+    min-height: 0;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    background: #ffffff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+#tv-chart {
+    position: absolute;
+    inset: 0;
+}
+
+/* Overlay legend (built in tv_chart.js). */
+.pos-legend {
+    position: absolute;
+    top: 10px;
+    left: 12px;
+    z-index: 3;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 6px 10px;
+    background: rgba(255, 255, 255, 0.85);
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    pointer-events: none;
+}
+
+.pos-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+
+/* Hover tooltip (built in tv_chart.js). */
+.pos-tooltip {
+    position: absolute;
+    z-index: 4;
+    pointer-events: none;
+    display: none;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    background: rgba(15, 23, 42, 0.9);
+    color: #ffffff;
+    border-radius: 6px;
+    font-size: 0.78rem;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+}
+
+.pos-tooltip-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.pos-legend-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+}

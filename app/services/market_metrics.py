@@ -4,6 +4,49 @@ import numpy as np
 import json
 from datetime import datetime, timedelta
 
+def download_ohlc_to_csv(tickers, csv_filename, days=181):
+    """Download daily OHLC for `tickers` and write it to `csv_filename` (wide format).
+
+    Lightweight refresh used by the positions chart: same download + flatten logic
+    as metrics_separate_tabs (Open_TICKER / High_TICKER / Low_TICKER / Close_TICKER,
+    indexed by Date), but without the technical-metric computation. Returns True on
+    success, False if nothing was downloaded.
+    """
+    if not tickers:
+        print("download_ohlc_to_csv: no tickers given, skipping.")
+        return False
+
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days)
+
+    try:
+        tickers_data = yf.download(
+            tickers, start=start_date, end=end_date,
+            auto_adjust=False, group_by='ticker',
+        )
+    except Exception as e:
+        print(f"download_ohlc_to_csv: yfinance error: {e}")
+        return False
+
+    if tickers_data is None or tickers_data.empty:
+        print("download_ohlc_to_csv: no data returned.")
+        return False
+
+    if isinstance(tickers_data.columns, pd.MultiIndex):
+        ohlc_data = tickers_data.loc[:, tickers_data.columns.get_level_values(1).isin(['Open', 'High', 'Low', 'Close'])]
+        ohlc_data.columns = [f'{price_type}_{ticker}' for ticker, price_type in ohlc_data.columns]
+    else:
+        single_ticker = tickers[0]
+        ohlc_data = tickers_data[['Open', 'High', 'Low', 'Close']].copy()
+        ohlc_data.columns = [f'{col}_{single_ticker}' for col in ohlc_data.columns]
+
+    ohlc_data = ohlc_data.reindex(sorted(ohlc_data.columns), axis=1)
+    ohlc_data.index.name = 'Date'
+    ohlc_data.to_csv(csv_filename)
+    print(f"download_ohlc_to_csv: wrote {csv_filename} ({len(ohlc_data)} rows, {len(tickers)} tickers).")
+    return True
+
+
 def metrics_separate_tabs(tickers, procedure_choice, market_mappings):
     """
     Pobiera dane giełdowe, oblicza wskaźniki techniczne i zwraca oczyszczony DataFrame,
