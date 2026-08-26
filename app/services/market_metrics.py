@@ -2,7 +2,52 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import json
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+
+EXCHANGE_CACHE_FILE = "ticker_exchange_cache.json"
+
+
+def _load_exchange_cache():
+    if os.path.exists(EXCHANGE_CACHE_FILE):
+        try:
+            with open(EXCHANGE_CACHE_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_exchange_cache(cache):
+    with open(EXCHANGE_CACHE_FILE, "w") as f:
+        json.dump(cache, f)
+
+
+def _fetch_exchange(ticker_str):
+    try:
+        return ticker_str, yf.Ticker(ticker_str).info.get('exchange', 'N/A')
+    except Exception:
+        return ticker_str, 'ErrorFetchingInfo'
+
+
+def get_market_info(tickers, max_workers=20):
+    """Resolve each ticker's listing exchange, using a disk cache and threaded fetch for misses."""
+    cache = _load_exchange_cache()
+    market_info_dict = {t: cache[t] for t in tickers if t in cache}
+    missing = [t for t in tickers if t not in cache]
+
+    if missing:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_fetch_exchange, t) for t in missing]
+            for future in as_completed(futures):
+                ticker_str, exchange = future.result()
+                market_info_dict[ticker_str] = exchange
+                if exchange not in ('N/A', 'ErrorFetchingInfo'):
+                    cache[ticker_str] = exchange
+        _save_exchange_cache(cache)
+
+    return market_info_dict
 
 def download_ohlc_to_csv(tickers, csv_filename, days=181):
     """Download daily OHLC for `tickers` and write it to `csv_filename` (wide format).
@@ -220,13 +265,7 @@ def metrics_separate_tabs(tickers, procedure_choice, market_mappings):
 
     print("Pobieranie informacji o rynkach...")
     # Krok 3: Dodawanie informacji o giełdzie i URL
-    market_info_dict = {}
-    for ticker_str in result_df['ticker']:
-        try:
-            ticker_obj = yf.Ticker(ticker_str)
-            market_info_dict[ticker_str] = ticker_obj.info.get('exchange', 'N/A')
-        except Exception:
-            market_info_dict[ticker_str] = 'ErrorFetchingInfo'
+    market_info_dict = get_market_info(result_df['ticker'].tolist())
 
     result_df['market'] = result_df['ticker'].map(market_info_dict)
     result_df['market_real'] = result_df['market'].map(market_mappings).fillna('N/A')

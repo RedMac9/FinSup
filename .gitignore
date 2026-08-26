@@ -2,7 +2,7 @@
 credentials.json
 token.json
 FinSup.code-workspace
-
+ticker_exchange_cache.json
 
 #Ignore all xlsx files
 *.xlsx

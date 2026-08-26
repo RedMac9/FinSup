@@ -8,9 +8,11 @@ from google.oauth2 import service_account
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 SPREADSHEET_ID = '1q0-tqU-C6_z11GfoCX4Ex4-QNYJhKsHFsLEYXjte5Iw'
 
-# Correctly join the folder and filename to create the path
-# This makes the code work on any operating system.
-SERVICE_ACCOUNT_FILE = os.path.join('secrets', 'finsup2-proj-90ea4909d4c5.json')
+# Anchored to this file's location (not the process cwd), so auth doesn't
+# silently fail when the app is launched from a different working directory.
+SERVICE_ACCOUNT_FILE = os.path.join(
+    os.path.dirname(__file__), '..', '..', 'secrets', 'finsup2-proj-90ea4909d4c5.json'
+)
 
 
 def init_client():
@@ -63,6 +65,10 @@ def gsheet_update(metrics1, creds, procedure_choice):
 
     print("Input DataFrame (metrics1) sample:")
     print(metrics1.head())
+
+    if creds is None:
+        print("Error: No credentials available (init_client() failed earlier). Skipping Google Sheets update.")
+        return
 
     try:
         service = build('sheets', 'v4', credentials=creds)
@@ -122,6 +128,10 @@ def gsheet_update_db(metrics1, creds):
     print("Input DataFrame (metrics1) sample:")
     print(metrics1.head())
 
+    if creds is None:
+        print("Error: No credentials available (init_client() failed earlier). Skipping Google Sheets update.")
+        return
+
     try:
         service = build('sheets', 'v4', credentials=creds)
         sheet_name = "ON"
@@ -170,6 +180,10 @@ def gsheet_update_db_roi(metrics1, creds):
 
     print("Input DataFrame (metrics1) sample:")
     print(metrics1.head())
+
+    if creds is None:
+        print("Error: No credentials available (init_client() failed earlier). Skipping Google Sheets update.")
+        return
 
     try:
         service = build('sheets', 'v4', credentials=creds)

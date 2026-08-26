@@ -1,3 +1,4 @@
+from datetime import datetime
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -5,6 +6,8 @@ import dash
 from dash import dcc, html
 from dash.dependencies import Input, Output, State
 from tickers_lists.ticker_groups import payloadPROD_db
+
+ALL_METRICS = ['Close', 'Open', 'High', 'Low']
 
 
 # --- Helper Functions ---
@@ -33,7 +36,8 @@ def _create_filter_slider(label_text, slider_id, min_val, max_val, step, value, 
     ], style=style or {})
 
 
-def graph_start(procedure_choice, def_filter_graph_list, server=None):
+def _load_data(procedure_choice):
+    """Reads the CSVs and DB fresh and returns a dict of everything the Dash layout/callbacks need."""
     # --- 1. Data Loading and Preparation ---
     open_positions = payloadPROD_db()
 
@@ -130,8 +134,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
     df_melted.sort_values('Date', inplace=True)
     df_melted.dropna(subset=['Price'], inplace=True)
 
-    # Get unique tickers and available metrics for the controls
-    ALL_METRICS = ['Close', 'Open', 'High', 'Low']
+    # Get unique tickers for the controls
     if df_melted['Date'].empty:
         print("Error: No dates available after preprocessing.")
         return
@@ -262,10 +265,27 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
     # Sort ticker_info by pct_diff descending
     ticker_info = sorted(ticker_info, key=lambda x: x['pct_diff'], reverse=True)
 
+    return {
+        'df_melted': df_melted,
+        'close_prices_df': close_prices_df,
+        'ticker_info': ticker_info,
+        'all_themes': all_themes,
+        'max_days': max_days,
+        'open_positions': open_positions,
+        'loaded_at': datetime.now(),
+    }
+
+
+def graph_start(procedure_choice, def_filter_graph_list, server=None):
+    data = _load_data(procedure_choice)
+    if data is None:
+        return
+    state = dict(data)
+
     # --- 3. Initialize the Dash App ---
     app = dash.Dash(
-        __name__, 
-        server=server if server is not None else True, 
+        __name__,
+        server=server if server is not None else True,
         url_base_pathname=f'/graph/{procedure_choice}/'
     )
 
@@ -285,7 +305,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
             html.Label("Filter by Theme:", className="field-label"),
             dcc.Dropdown(
                 id='theme-filter-dropdown',
-                options=[{'label': theme, 'value': theme} for theme in all_themes],
+                options=[{'label': theme, 'value': theme} for theme in state['all_themes']],
                 multi=True,
                 placeholder="Select themes...",
                 className="m3-dropdown"
@@ -555,7 +575,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                     theme_filter_layout,
                                     dcc.Dropdown(
                                         id="ticker-dropdown",
-                                        options=[{'label': t['label'], 'value': t['value']} for t in ticker_info],
+                                        options=[{'label': t['label'], 'value': t['value']} for t in state['ticker_info']],
                                         value=initial_dropdown_value,
                                         multi=True,
                                         className="m3-dropdown",
@@ -580,6 +600,19 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                 children=[
                                     html.Div("Stock Ticker Performance Analysis", className="top-caption"),
                                     html.H2("Dashboard", className="top-title"),
+                                    html.Div(
+                                        [
+                                            html.Button("Reload Data", id="reload-data-button", className="btn-tonal", n_clicks=0),
+                                            html.Span(
+                                                f"Loaded at {state['loaded_at'].strftime('%Y-%m-%d %H:%M:%S')}",
+                                                id="reload-status",
+                                                className="mini-label",
+                                                style={'marginLeft': '10px'},
+                                            ),
+                                        ],
+                                        style={'marginTop': '8px'},
+                                    ),
+                                    dcc.Interval(id="initial-load-trigger", interval=500, max_intervals=1),
                                 ],
                             ),
                             html.Div(
@@ -597,12 +630,12 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                         dcc.RangeSlider(
                                             id="days-slider",
                                             min=0,
-                                            max=max_days - 1,
-                                            value=[max(0, max_days - 30), max_days - 1],
+                                            max=state['max_days'] - 1,
+                                            value=[max(0, state['max_days'] - 30), state['max_days'] - 1],
                                             step=1,
                                             marks={
-                                                0: (df_melted['Date'].min()).strftime('%Y-%m-%d'),
-                                                max_days - 1: (df_melted['Date'].max()).strftime('%Y-%m-%d')
+                                                0: (state['df_melted']['Date'].min()).strftime('%Y-%m-%d'),
+                                                state['max_days'] - 1: (state['df_melted']['Date'].max()).strftime('%Y-%m-%d')
                                             },
                                             className="compact-range-slider"
                                         ),
@@ -705,6 +738,9 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
         """
         Filters the ticker dropdown options based on various filter sliders.
         """
+        ticker_info = state['ticker_info']
+        close_prices_df = state['close_prices_df']
+        open_positions = state['open_positions']
         if not ticker_info:
             return []
 
@@ -844,6 +880,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
             )
             return fig, "No days selected"
 
+        df_melted = state['df_melted']
         min_date = df_melted['Date'].min()
         start_idx, end_idx = date_range
         start_date = min_date + pd.to_timedelta(start_idx, unit='D')
@@ -943,6 +980,52 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
         fig.data[curve_number].visible = trace_visible_state
 
         return fig, list(hidden_set)
+
+    @app.callback(
+        [Output('ticker-dropdown', 'options', allow_duplicate=True),
+         Output('ticker-dropdown', 'value', allow_duplicate=True),
+         Output('theme-filter-dropdown', 'options', allow_duplicate=True),
+         Output('days-slider', 'min', allow_duplicate=True),
+         Output('days-slider', 'max', allow_duplicate=True),
+         Output('days-slider', 'value', allow_duplicate=True),
+         Output('days-slider', 'marks', allow_duplicate=True),
+         Output('reload-status', 'children')],
+        [Input('reload-data-button', 'n_clicks'),
+         Input('initial-load-trigger', 'n_intervals')],
+        [State('ticker-dropdown', 'value')],
+        prevent_initial_call=True
+    )
+    def reload_data(n_clicks, n_intervals, current_selection):
+        """Re-reads the CSV/DB from disk and refreshes the in-memory dataset used by all other callbacks."""
+        new_data = _load_data(procedure_choice)
+        if new_data is None:
+            return (dash.no_update,) * 7 + (
+                f"Reload failed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - check server logs",
+            )
+
+        state.clear()
+        state.update(new_data)
+
+        ticker_info = state['ticker_info']
+        df_melted = state['df_melted']
+        max_days = state['max_days']
+
+        options = [{'label': t['label'], 'value': t['value']} for t in ticker_info]
+        valid_values = {t['value'] for t in ticker_info}
+        new_selection = [v for v in (current_selection or []) if v in valid_values]
+        if not new_selection:
+            new_selection = [v for v in initial_dropdown_value if v in valid_values]
+
+        theme_options = [{'label': theme, 'value': theme} for theme in state['all_themes']]
+
+        marks = {
+            0: df_melted['Date'].min().strftime('%Y-%m-%d'),
+            max_days - 1: df_melted['Date'].max().strftime('%Y-%m-%d'),
+        }
+        slider_value = [max(0, max_days - 30), max_days - 1]
+        status = f"Loaded at {state['loaded_at'].strftime('%Y-%m-%d %H:%M:%S')}"
+
+        return options, new_selection, theme_options, 0, max_days - 1, slider_value, marks, status
 
     # Start the web server
     if not server:
