@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import os # Imported to handle file paths robustly
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -7,6 +8,18 @@ from google.oauth2 import service_account
 # --- Constants ---
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 SPREADSHEET_ID = '1q0-tqU-C6_z11GfoCX4Ex4-QNYJhKsHFsLEYXjte5Iw'
+
+
+def _values_for_sheets(df):
+    """
+    Converts a DataFrame to a list-of-lists safe for the Sheets API.
+    NaN/inf are not valid JSON tokens and make the API reject the whole
+    payload with a 400 "Invalid JSON payload" error, so they're replaced
+    with None (serializes to JSON null) before the values are collected.
+    """
+    clean = df.replace([np.inf, -np.inf], np.nan).astype(object)
+    clean = clean.where(pd.notnull(clean), None)
+    return [df.columns.tolist()] + clean.values.tolist()
 
 # Anchored to this file's location (not the process cwd), so auth doesn't
 # silently fail when the app is launched from a different working directory.
@@ -95,7 +108,7 @@ def gsheet_update(metrics1, creds, procedure_choice):
             body={}
         ).execute()
 
-        values_to_write = [metrics1.columns.tolist()] + metrics1.values.tolist()
+        values_to_write = _values_for_sheets(metrics1)
 
         print(f"Writing {len(values_to_write)} rows to '{range_to_write}'...")
         
@@ -148,7 +161,7 @@ def gsheet_update_db(metrics1, creds):
             body={}
         ).execute()
 
-        values_to_write = [metrics1.columns.tolist()] + metrics1.values.tolist()
+        values_to_write = _values_for_sheets(metrics1)
 
         print(f"Writing {len(values_to_write)} rows to '{range_to_write}'...")
         
@@ -201,7 +214,7 @@ def gsheet_update_db_roi(metrics1, creds):
             body={}
         ).execute()
 
-        values_to_write = [metrics1.columns.tolist()] + metrics1.values.tolist()
+        values_to_write = _values_for_sheets(metrics1)
 
         print(f"Writing {len(values_to_write)} rows to '{range_to_write}'...")
         
