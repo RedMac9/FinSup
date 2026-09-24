@@ -1,3 +1,21 @@
+# Version of this module - bump on EVERY change to this file (see CLAUDE.md).
+# MAJOR: breaking layout/behaviour change, MINOR: new feature, PATCH: fix.
+#   1.0.0 - baseline (screener filters, indicator overlays, reload button)
+#   1.1.0 - DiNapoli levels/zones drawn across the visible window (were
+#           legend-only); one legend entry per ticker+indicator; version shown
+#           in the top bar
+#   1.2.0 - strategy-document features: D/W/M trend (dropdown labels, badges,
+#           screener filters), volume-ratio filter, Daily/Weekly interval
+#           switch, zones as shaded bands, stacked sub-panes for separate-pane
+#           indicators (Volume, % from ATH30), volume bars, per-ticker
+#           indicator cache (cleared on Reload Data)
+#   1.3.0 - nav rail removed; drawer toggle (≡) moved into the top of the
+#           "Ticker filters" drawer, "≡ Filters" button in the top bar
+#           re-opens it while hidden
+#   1.4.0 - Date Range: 30/90/180/360-day preset buttons and a calendar
+#           range picker, kept in sync with the slider
+__version__ = "1.4.0"
+
 from datetime import datetime
 import pandas as pd
 import plotly.express as px
@@ -6,8 +24,19 @@ import dash
 from dash import dcc, html
 from dash.dependencies import Input, Output, State
 from tickers_lists.ticker_groups import payloadPROD_db
+from services.indicators import INDICATORS, compute_indicators, resample_ohlc, volume_ratio
+from services.dinapoli_overlay import trend_summary
+from output.positions_chart import TREND_ARROWS, trend_badge
 
 ALL_METRICS = ['Close', 'Open', 'High', 'Low']
+OHLCV_METRICS = ['Open', 'High', 'Low', 'Close', 'Volume']
+RANGE_PRESETS = (30, 90, 180, 360)   # "last N days" buttons next to the date slider
+TREND_OPTIONS = [{'label': 'any', 'value': 'any'},
+                 {'label': '↑ wzrostowy', 'value': 'wzrostowy'},
+                 {'label': '↓ spadkowy', 'value': 'spadkowy'},
+                 {'label': '→ boczny', 'value': 'boczny'}]
+ALL_INDICATOR_NAMES = list(INDICATORS.keys())
+DEFAULT_INDICATOR_NAMES = [name for name, spec in INDICATORS.items() if spec["default_on"]]
 
 
 # --- Helper Functions ---
@@ -223,8 +252,12 @@ def _load_data(procedure_choice):
     # For ETF themes: latest theme per ticker if present
     if procedure_choice == "13":
         latest_theme = df_melted.groupby('Ticker')['Theme'].last()
+        # Per-ticker ETF details for the chart hover (price rows are rebuilt
+        # from the wide frame in update_graph, so they don't carry these).
+        ticker_meta = df_melted.groupby('Ticker')[['Theme', 'Country/Region']].last()
     else:
         latest_theme = pd.Series(dtype='object')
+        ticker_meta = None
 
     # Create a list of dictionaries containing ticker info for the dropdown
     ticker_info = []
@@ -236,14 +269,23 @@ def _load_data(procedure_choice):
         days_above_ema32_30 = latest_days_above_ema32_30.get(ticker, 0)
         days_above_high30 = latest_days_above_high30.get(ticker, 0)
 
+        # D/W/M trend (strategy document's primary context) + volume vs its
+        # 20-day average ("na większych obrotach").
+        ohlc = _wide_ohlc(df, ticker)
+        trend = trend_summary(ohlc)
+        vol_ratio = volume_ratio(ohlc)
+        trend_txt = (" ".join(f"{tf}{TREND_ARROWS.get(trend[tf], ('?',))[0]}" for tf in ("D", "W", "M"))
+                     if trend else "trend ?")
+        vol_txt = f", Vol×{vol_ratio:.1f}" if vol_ratio is not None else ""
+
         label = (
-            f"{ticker} (ATH: {pct_diff:.1f}%, "
+            f"{ticker} [{trend_txt}] (ATH: {pct_diff:.1f}%, "
             f"EMA30: {days_above_ema30:.0f}d, "
             f"SMA30: {days_above_sma30:.0f}d, "
             f"SMA90: {days_above_sma90:.0f}d, "
             f"SMA20-30d: {days_above_sma20_30:.0f}d, "
             f"EMA32-30d: {days_above_ema32_30:.0f}d, "
-            f"High30: {days_above_high30:.0f}d)"
+            f"High30: {days_above_high30:.0f}d{vol_txt})"
         )
 
         info = {
@@ -255,7 +297,9 @@ def _load_data(procedure_choice):
             'days_above_ema30': float(days_above_ema30) if pd.notna(days_above_ema30) else 0.0,
             'days_above_sma20_30': float(days_above_sma20_30) if pd.notna(days_above_sma20_30) else 0.0,
             'days_above_ema32_30': float(days_above_ema32_30) if pd.notna(days_above_ema32_30) else 0.0,
-            'days_above_high30': float(days_above_high30) if pd.notna(days_above_high30) else 0.0
+            'days_above_high30': float(days_above_high30) if pd.notna(days_above_high30) else 0.0,
+            'trend': trend,
+            'vol_ratio': vol_ratio,
         }
         if procedure_choice == "13":
             info['theme'] = latest_theme.get(ticker, 'N/A')
@@ -266,6 +310,8 @@ def _load_data(procedure_choice):
     ticker_info = sorted(ticker_info, key=lambda x: x['pct_diff'], reverse=True)
 
     return {
+        'df_wide': df,
+        'ticker_meta': ticker_meta,
         'df_melted': df_melted,
         'close_prices_df': close_prices_df,
         'ticker_info': ticker_info,
@@ -274,6 +320,219 @@ def _load_data(procedure_choice):
         'open_positions': open_positions,
         'loaded_at': datetime.now(),
     }
+
+
+def _wide_ohlc(df_wide, ticker):
+    """Tidy (Date, Open, High, Low, Close[, Volume]) for one ticker, sliced
+    straight from the wide historical_prices_*.csv frame - much faster than
+    filtering the melted frame, which matters because every screener ticker
+    is touched at load (trend state, volume ratio). Uses the ticker's whole
+    loaded history, so rolling/EMA indicators have enough lookback right from
+    the first visible bar - the resulting series are trimmed to the window
+    afterwards.
+    """
+    cols = {f"{m}_{ticker}": m for m in OHLCV_METRICS if f"{m}_{ticker}" in df_wide.columns}
+    if 'Close' not in cols.values():
+        return pd.DataFrame(columns=['Date', 'Open', 'High', 'Low', 'Close'])
+    out = df_wide[['Date'] + list(cols)].rename(columns=cols)
+    price_cols = [c for c in ('Open', 'High', 'Low', 'Close') if c in out.columns]
+    return out.dropna(subset=price_cols).sort_values('Date').reset_index(drop=True)
+
+
+def _price_rows(ohlc, ticker, metrics):
+    """Tidy OHLC -> long (Date, Metric, Ticker, Price) rows, the shape the
+    px.line price chart is built from."""
+    keep = [m for m in metrics if m in ohlc.columns]
+    rows = ohlc.melt(id_vars=['Date'], value_vars=keep, var_name='Metric', value_name='Price')
+    rows['Ticker'] = ticker
+    return rows.dropna(subset=['Price'])
+
+
+def _rgba(hex_color, alpha):
+    h = (hex_color or '#64748b').lstrip('#')
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return f'rgba({r},{g},{b},{alpha})'
+
+
+def _indicator_traces(ticker, ohlc, selected_indicators, base, start_date, end_date,
+                      cache=None, cache_key=None):
+    """Plotly traces for one ticker's selected indicators (see
+    services/indicators.py - the same registry app/output/positions_chart.py
+    uses), rebased onto the chart's normalized '% change from day 0' scale
+    and clipped to the visible date range. `ohlc` is the ticker's tidy frame
+    at the displayed interval (daily or weekly).
+
+    Marker-type series (EMA32 cross, DiNapoli setups, ...) carry a date and
+    an up/down side but no y-value - there's no OHLC bar to anchor "above"/
+    "below" to on this line chart, so they're placed just off the ticker's
+    own normalized price line at that date instead.
+
+    Traces of pane="separate" series carry meta={'pane': ...}; update_graph()
+    moves them onto their own stacked y-axis.
+    """
+    if not selected_indicators or not base or ohlc is None or ohlc.empty:
+        return []
+
+    norm_price = (ohlc.set_index('Date')['Close'] / base - 1.0) * 100.0
+
+    traces = []
+    # One indicator per compute_indicators() call so every series it returns
+    # (e.g. 20 DiNapoli level lines) can share a single legend entry/group.
+    for ind_name in selected_indicators:
+        # Series depend only on the ticker's data + interval, not on the
+        # visible window/base, so they're cached (the DiNapoli setup layer
+        # re-scans bar by bar and takes seconds on 3 years of data).
+        key = (cache_key, ind_name)
+        if cache is not None and key in cache:
+            series = cache[key]
+        else:
+            series = compute_indicators(ohlc, [ind_name])
+            if cache is not None:
+                cache[key] = series
+        traces.extend(_series_traces(ticker, ind_name, series, norm_price,
+                                     base, start_date, end_date))
+    return traces
+
+
+def _series_traces(ticker, ind_name, series, norm_price, base, start_date, end_date):
+    """Plotly traces for the series dicts of one indicator. All traces share
+    the legend group '<TICKER> <indicator>'; only the first shows in the legend.
+    """
+    group = f"{ticker} {ind_name}"
+    traces = []
+
+    def legend():
+        return dict(legendgroup=group, showlegend=not traces)
+
+    def rebase_price(v):
+        return (v / base - 1.0) * 100.0
+
+    for s in series:
+        name = f"{ticker} {s['title']}"
+        label = group if len(series) > 1 else name
+
+        if s['type'] == 'band':
+            # Shaded zone rectangle from the date the zone formed (or the
+            # window start) to the window end, with its label at the top-left.
+            fill = s.get('opacity', 0.18)
+            for b in s['data']:
+                x0, x1 = max(pd.to_datetime(b['start']), start_date), end_date
+                if x0 > x1:
+                    continue
+                top, bot = rebase_price(b['top']), rebase_price(b['bottom'])
+                traces.append(go.Scatter(
+                    x=[x0, x1, x1, x0, x0], y=[bot, bot, top, top, bot],
+                    mode='lines', fill='toself', fillcolor=_rgba(b['color'], fill),
+                    line=dict(width=0), name=group, hoverinfo='skip', **legend(),
+                ))
+                traces.append(go.Scatter(
+                    x=[x0], y=[top], mode='text', text=[b['label']],
+                    textposition='top right', textfont=dict(size=10, color=b['color']),
+                    name=group, legendgroup=group, showlegend=False,
+                    hovertemplate=f"{ticker} {b['detail']}<extra></extra>",
+                ))
+            continue
+
+        if s['type'] == 'markers':
+            xs, ys, texts, symbols, colors = [], [], [], [], []
+            times = pd.to_datetime([m['time'] for m in s['data']])
+            for t, m in zip(times, s['data']):
+                if t < start_date or t > end_date or t not in norm_price.index:
+                    continue
+                offset = -2.5 if m['position'] == 'belowBar' else 2.5
+                xs.append(t)
+                ys.append(norm_price.loc[t] + offset)
+                texts.append(m['text'])
+                symbols.append('triangle-up' if m['shape'] == 'arrowUp'
+                              else 'triangle-down' if m['shape'] == 'arrowDown'
+                              else 'circle')
+                colors.append(m['color'])
+            if not xs:
+                continue
+            traces.append(go.Scatter(
+                x=xs, y=ys, mode='markers', name=label, **legend(),
+                marker=dict(symbol=symbols, color=colors, size=9,
+                           line=dict(width=1, color='#1f2937')),
+                text=texts,
+                hovertemplate=f'{name}<br>%{{text}}<br>%{{x|%Y-%m-%d}}<extra></extra>',
+            ))
+            continue
+
+        # Line/histogram series: price-scale ones ("main" pane) get rebased
+        # the same way the price line itself is, so e.g. SMA20 stays glued
+        # to the % line instead of floating off in raw price units. Anything
+        # in its own pane (pane="separate", e.g. Volume, "% from ATH30") keeps
+        # its units and goes on its own y-axis.
+        #
+        # Horizontal lines (DiNapoli levels) are sent as just two points -
+        # where the level was born and the last date. Plain clipping would
+        # drop the first one when it's before the visible window, leaving a
+        # single point that plotly can't draw as a line, so those are
+        # clamped to the window edges instead.
+        separate = s['pane'] == 'separate'
+        rebase = (lambda v: v) if separate else rebase_price
+        data = s['data']
+        values = {d['value'] for d in data}
+        colors = None
+        if len(data) >= 2 and len(values) == 1:
+            t_first = max(pd.to_datetime(data[0]['time']), start_date)
+            t_last = min(pd.to_datetime(data[-1]['time']), end_date)
+            if t_first > t_last:
+                continue
+            xs = [t_first, t_last]
+            ys = [rebase(data[0]['value'])] * 2
+        else:
+            # Parse all dates in one call - per-point pd.to_datetime() made
+            # this the slowest part of the callback on 3 years of history.
+            times = pd.to_datetime([d['time'] for d in data])
+            keep = [i for i, t in enumerate(times) if start_date <= t <= end_date]
+            xs = [times[i] for i in keep]
+            ys = [rebase(data[i]['value']) for i in keep]
+            colors = [data[i].get('color', s['color']) for i in keep]
+        if not xs:
+            continue
+        meta = {'pane': group} if separate else None
+        if s['type'] == 'histogram' and separate:
+            traces.append(go.Bar(
+                x=xs, y=ys, name=label, marker_color=colors or s['color'], meta=meta,
+                **legend(),
+                hovertemplate=f'{name}<br>%{{y:,.0f}}<br>%{{x|%Y-%m-%d}}<extra></extra>',
+            ))
+            continue
+        traces.append(go.Scatter(
+            x=xs, y=ys, mode='lines', name=label, meta=meta, **legend(),
+            line=dict(color=s['color'], width=1.3,
+                     dash='dot' if s['type'] == 'histogram' else 'solid'),
+            hovertemplate=f'{name}<br>%{{y:.2f}}<br>%{{x|%Y-%m-%d}}<extra></extra>',
+        ))
+    return traces
+
+
+def _stack_panes(fig):
+    """Move every trace tagged meta={'pane': key} onto its own y-axis, stacked
+    as strips under the main price axis (one strip per ticker+indicator)."""
+    keys = []
+    for tr in fig.data:
+        key = (tr.meta or {}).get('pane') if isinstance(tr.meta, dict) else None
+        if key and key not in keys:
+            keys.append(key)
+    if not keys:
+        return
+    n = len(keys)
+    strip = min(0.2, 0.45 / n)
+    fig.update_layout(yaxis=dict(domain=[n * strip + 0.03, 1.0]))
+    for i, key in enumerate(keys):
+        axis_no = i + 2
+        lo = (n - i - 1) * strip
+        fig.update_layout(**{f'yaxis{axis_no}': dict(
+            domain=[lo, lo + strip - 0.015], anchor='x', showgrid=False,
+            title=dict(text=key, font=dict(size=9)), tickfont=dict(size=9),
+        )})
+        for tr in fig.data:
+            if isinstance(tr.meta, dict) and tr.meta.get('pane') == key:
+                tr.update(yaxis=f'y{axis_no}')
+    # x-axis labels under the bottom strip rather than under the price axis.
+    fig.update_layout(xaxis=dict(anchor=f'y{n + 1}'), barmode='overlay')
 
 
 def graph_start(procedure_choice, def_filter_graph_list, server=None):
@@ -317,22 +576,6 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
         id="app-shell",
         children=[
             dcc.Store(id='drawer-state', data={'visible': True}),
-            # Rail
-            html.Nav(
-                className="nav-rail",
-                children=[
-                    html.Button("≡", className="rail-fab", id="rail-toggle"),
-                    html.Div(
-                        className="rail-links",
-                        children=[
-                            html.Button("Dashboard", className="rail-link active", id="rail-dashboard"),
-                            html.Button("Filters", className="rail-link", id="rail-filters"),
-                            html.Button("Charts", className="rail-link", id="rail-charts"),
-                            html.Button("Universe", className="rail-link", id="rail-universe"),
-                        ],
-                    ),
-                ],
-            ),
             # Drawer
             html.Aside(
                 className="filter-drawer",
@@ -341,16 +584,15 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                     html.Div(
                         className="drawer-header",
                         children=[
+                            html.Button("≡", className="drawer-toggle", id="drawer-toggle",
+                                        title="Hide ticker filters"),
                             html.H1("Ticker filters", className="drawer-title"),
-                            html.P(
-                                "M3 Material Layout with Rail and Drawer.",
-                                className="drawer-subtitle",
-                            ),
                         ],
                     ),
                     # Core Filters Section
                     html.Div(
                         className="drawer-section",
+                        id="section-core-filters",
                         children=[
                             html.Div("Core filters", className="section-label"),
                             html.Div(
@@ -455,6 +697,38 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                                 id="high30-filter-slider",
                                                 min=0, max=30, step=1, value=[0, 30],
                                                 marks={i: str(i) for i in range(0, 31, 10)},
+                                            ),
+                                        ],
+                                    ),
+                                    # D/W/M trend (Dow-style, from DiNapoli swings)
+                                    html.Div(
+                                        className="filter-item",
+                                        children=[
+                                            html.Div("Trend (D / W / M)", className="field-label block"),
+                                            html.Div(
+                                                className="grid-2",
+                                                children=[
+                                                    html.Div(
+                                                        className="field-surface",
+                                                        children=[
+                                                            html.Label(f"Trend {tf}", className="mini-label"),
+                                                            dcc.Dropdown(id=f"trend-{tf.lower()}-filter",
+                                                                         options=TREND_OPTIONS, value="any",
+                                                                         clearable=False, className="m3-dropdown"),
+                                                        ],
+                                                    )
+                                                    for tf in ("D", "W", "M")
+                                                ] + [
+                                                    html.Div(
+                                                        className="field-surface",
+                                                        children=[
+                                                            html.Label("Min volume × avg20", className="mini-label"),
+                                                            dcc.Input(id="volume-ratio-input", type="number",
+                                                                      value=None, min=0, step=0.1,
+                                                                      placeholder="off", className="m3-input"),
+                                                        ],
+                                                    ),
+                                                ],
                                             ),
                                         ],
                                     ),
@@ -567,6 +841,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                     # Ticker Selection Section
                     html.Div(
                         className="drawer-section",
+                        id="section-ticker-selection",
                         children=[
                             html.Div("Ticker selection", className="section-label"),
                             html.Div(
@@ -594,11 +869,16 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                     # Top Bar
                     html.Header(
                         className="top-app-bar",
+                        id="section-dashboard",
                         children=[
                             html.Div(
                                 className="title-block",
                                 children=[
-                                    html.Div("Stock Ticker Performance Analysis", className="top-caption"),
+                                    # Only shown while the filter drawer is hidden
+                                    # (its own ≡ toggle is then off-screen).
+                                    html.Button("≡ Filters", id="drawer-open", className="btn-tonal drawer-open",
+                                                style={'display': 'none'}, title="Show ticker filters"),
+                                    html.Div(f"Stock Ticker Performance Analysis · graph.py v{__version__}", className="top-caption"),
                                     html.H2("Dashboard", className="top-title"),
                                     html.Div(
                                         [
@@ -625,8 +905,50 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                         multi=True,
                                         className="compact-dropdown",
                                     ),
+                                    dcc.RadioItems(
+                                        id="interval-radio",
+                                        options=[{"label": "D", "value": "D"},
+                                                 {"label": "W", "value": "W"}],
+                                        value="D",
+                                        inline=True,
+                                        className="toggle-checklist",
+                                    ),
+                                    dcc.Dropdown(
+                                        id="indicator-checklist",
+                                        options=[{"label": n, "value": n} for n in ALL_INDICATOR_NAMES],
+                                        value=DEFAULT_INDICATOR_NAMES,
+                                        multi=True,
+                                        placeholder="Indicators...",
+                                        className="compact-dropdown",
+                                    ),
                                     html.Div([
-                                        html.Label("Date Range:", className="mini-label"),
+                                        html.Div(
+                                            className="date-range-head",
+                                            children=[
+                                                html.Label("Date Range:", className="mini-label"),
+                                                html.Div(
+                                                    className="range-presets",
+                                                    children=[
+                                                        html.Button(f"{n}d", id=f"range-{n}", n_clicks=0,
+                                                                    className="range-btn active" if n == 30 else "range-btn",
+                                                                    title=f"Last {n} days")
+                                                        for n in RANGE_PRESETS
+                                                    ],
+                                                ),
+                                                dcc.DatePickerRange(
+                                                    id="date-picker",
+                                                    min_date_allowed=state['df_melted']['Date'].min().date(),
+                                                    max_date_allowed=state['df_melted']['Date'].max().date(),
+                                                    start_date=(state['df_melted']['Date'].min()
+                                                                + pd.Timedelta(days=max(0, state['max_days'] - 30))).date(),
+                                                    end_date=state['df_melted']['Date'].max().date(),
+                                                    display_format='YYYY-MM-DD',
+                                                    first_day_of_week=1,
+                                                    minimum_nights=0,
+                                                    className="date-picker",
+                                                ),
+                                            ],
+                                        ),
                                         dcc.RangeSlider(
                                             id="days-slider",
                                             min=0,
@@ -652,6 +974,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                             # Graph Section
                             html.Section(
                                 className="analytics-grid",
+                                id="section-chart",
                                 style={'gridTemplateColumns': '1fr'},
                                 children=[
                                     html.Div(
@@ -664,6 +987,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                                     html.Div("Live selection", className="state-chip"),
                                                 ],
                                             ),
+                                            html.Div(id="trend-badges", className="trend-row"),
                                             dcc.Graph(id="price-performance-graph", style={'height': '70vh'}, className="graph-frame"),
                                         ],
                                     ),
@@ -683,29 +1007,43 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
     @app.callback(
         [Output('app-shell', 'style'),
          Output('filter-drawer', 'style'),
-         Output('drawer-state', 'data')],
-        [Input('rail-toggle', 'n_clicks')],
+         Output('drawer-state', 'data'),
+         Output('drawer-open', 'style')],
+        [Input('drawer-toggle', 'n_clicks'),
+         Input('drawer-open', 'n_clicks')],
         [State('drawer-state', 'data')]
     )
-    def toggle_drawer(n_clicks, state):
+    def toggle_drawer(toggle_clicks, open_clicks, state):
+        ctx = dash.callback_context
+        triggered = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else ''
+
         visible = state['visible']
-        if n_clicks:
+        if triggered == 'drawer-toggle':
             visible = not visible
-        
+        elif triggered == 'drawer-open':
+            visible = True
+
         shell_style = {
-            'gridTemplateColumns': f"96px {'392px' if visible else '0px'} minmax(0, 1fr)",
+            'gridTemplateColumns': f"{'392px' if visible else '0px'} minmax(0, 1fr)",
             'transition': 'grid-template-columns 0.3s ease',
         }
-        
+
         drawer_style = {
             'display': 'block', # Keep in grid to maintain column mapping
             'visibility': 'visible' if visible else 'hidden',
-            'overflow': 'hidden',
+            # X stays clipped so collapsing to 0px never shows a horizontal
+            # scrollbar; Y needs to scroll when open, or content taller than
+            # the viewport (e.g. the "Universe" ticker-selection section) is
+            # simply unreachable - 'overflow: hidden' on both axes was the
+            # previous behaviour and blocked that.
+            'overflowX': 'hidden',
+            'overflowY': 'auto' if visible else 'hidden',
             'width': '392px' if visible else '0px',
             'transition': 'width 0.3s, visibility 0.3s',
         }
-        
-        return shell_style, drawer_style, {'visible': visible}
+
+        open_style = {'display': 'none'} if visible else {'display': 'inline-block', 'marginBottom': '8px'}
+        return shell_style, drawer_style, {'visible': visible}, open_style
 
     @app.callback(
         Output('ticker-dropdown', 'options'),
@@ -727,14 +1065,21 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
             Input('price-change-days-input-1', 'value'),
             Input('price-change-pct-input-1', 'value'),
             Input('price-change-days-input-2', 'value'),
-            Input('price-change-pct-input-2', 'value')
+            Input('price-change-pct-input-2', 'value'),
+            Input('trend-d-filter', 'value'),
+            Input('trend-w-filter', 'value'),
+            Input('trend-m-filter', 'value'),
+            Input('volume-ratio-input', 'value'),
+            # Re-run after a data reload so options reflect the fresh state.
+            Input('reload-status', 'children'),
         ]
     )
     def update_dropdown_options(ath_slider_range, sma30_slider_range, ema30_slider_range, sma90_slider_range,
                                 sma20_30_slider_range, ema32_30_slider_range, high30_slider_range, selected_themes,
                                 open_positions_filter, ath_drop_enabled, ath_drop_days, ath_drop_std_pct,
                                 ath_drop_override_pct, ath_drop_bypass_count,
-                                pc1_days, pc1_min_pct, pc2_days, pc2_min_pct):
+                                pc1_days, pc1_min_pct, pc2_days, pc2_min_pct,
+                                trend_d, trend_w, trend_m, min_vol_ratio, _reload_status):
         """
         Filters the ticker dropdown options based on various filter sliders.
         """
@@ -763,6 +1108,18 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                 ema32_30_min <= t['days_above_ema32_30'] <= ema32_30_max and
                 high30_min <= t['days_above_high30'] <= high30_max)
         ]
+
+        # Apply D/W/M trend filters (tickers with unknown trend drop out as
+        # soon as any trend filter is set).
+        for tf, wanted in (("D", trend_d), ("W", trend_w), ("M", trend_m)):
+            if wanted and wanted != 'any':
+                filtered_tickers = [t for t in filtered_tickers
+                                    if t.get('trend') and t['trend'][tf] == wanted]
+
+        # Apply volume filter: last volume >= N x its 20-day average.
+        if min_vol_ratio:
+            filtered_tickers = [t for t in filtered_tickers
+                                if t.get('vol_ratio') is not None and t['vol_ratio'] >= min_vol_ratio]
 
         # Apply theme filter
         if selected_themes:
@@ -862,13 +1219,17 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
         [
             Input('ticker-dropdown', 'value'),
             Input('metric-checklist', 'value'),
-            Input('days-slider', 'value')
+            Input('days-slider', 'value'),
+            Input('indicator-checklist', 'value'),
+            Input('interval-radio', 'value'),
         ],
         [State('hidden-traces-store', 'data')]
     )
-    def update_graph(selected_tickers, selected_metrics, date_range, hidden_tickers):
+    def update_graph(selected_tickers, selected_metrics, date_range, selected_indicators,
+                     interval, hidden_tickers):
         """
         Updates the main performance graph based on user selections and returns the count of days.
+        Daily or weekly candles (interval), indicators computed at that interval.
         """
         if not selected_tickers or not selected_metrics or not date_range:
             fig = go.Figure()
@@ -890,14 +1251,24 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
         selected_days_count = (end_date - start_date).days + 1
         count_text = f"Selected: {selected_days_count} days"
 
-        # Base filtering
-        mask = (
-            (df_melted['Date'] >= start_date) &
-            (df_melted['Date'] <= end_date) &
-            (df_melted['Ticker'].isin(selected_tickers)) &
-            (df_melted['Metric'].isin(selected_metrics))
-        )
-        filtered_df = df_melted[mask].copy()
+        # Per-ticker OHLC at the displayed interval; the price lines and the
+        # indicators are both built from it, so weekly mode stays consistent.
+        ohlc_by_ticker = {}
+        for ticker in selected_tickers:
+            ohlc = _wide_ohlc(state['df_wide'], ticker)
+            if interval == 'W':
+                ohlc = resample_ohlc(ohlc, 'W')
+            if not ohlc.empty:
+                ohlc_by_ticker[ticker] = ohlc
+
+        rows = [_price_rows(o, t, selected_metrics) for t, o in ohlc_by_ticker.items()]
+        filtered_df = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(
+            columns=['Date', 'Metric', 'Price', 'Ticker'])
+        filtered_df = filtered_df[(filtered_df['Date'] >= start_date)
+                                  & (filtered_df['Date'] <= end_date)].copy()
+        meta = state.get('ticker_meta')
+        if meta is not None and not filtered_df.empty:
+            filtered_df = filtered_df.join(meta, on='Ticker')
 
         if filtered_df.empty:
             fig = go.Figure()
@@ -912,17 +1283,18 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
 
         # Define hover data
         hover_data_config = {'Price': ':.2f'}
-        if procedure_choice == "13":
-            hover_data_config['Theme'] = True
-            hover_data_config['Country/Region'] = True
+        for col in ('Theme', 'Country/Region'):
+            if col in filtered_df.columns:
+                hover_data_config[col] = True
 
         fig = px.line(
-            filtered_df,
+            filtered_df.sort_values(['Ticker', 'Metric', 'Date']),
             x='Date',
             y='Normalized Price (%)',
             color='Ticker',
             line_dash='Metric',
-            title=f'Price Performance ({start_date.strftime("%Y-%m-%d")} to {end_date.strftime("%Y-%m-%d")})',
+            title=(f'Price Performance{" (weekly)" if interval == "W" else ""} '
+                   f'({start_date.strftime("%Y-%m-%d")} to {end_date.strftime("%Y-%m-%d")})'),
             labels={'Normalized Price (%)': 'Price Change (%)'},
             hover_data=hover_data_config
         )
@@ -936,14 +1308,45 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
 
-        # Re-apply hidden state
+        # Indicator overlays (same registry app/output/positions_chart.py uses -
+        # see services/indicators.py). Rebased onto this chart's normalized
+        # '% change from day 0' scale in _indicator_traces().
+        if selected_indicators:
+            for ticker in selected_tickers:
+                close_rows = filtered_df[(filtered_df['Ticker'] == ticker)
+                                         & (filtered_df['Metric'] == 'Close')]
+                if close_rows.empty:
+                    continue
+                base = float(close_rows.sort_values('Date')['Price'].iloc[0]) or 1.0
+                for tr in _indicator_traces(ticker, ohlc_by_ticker.get(ticker), selected_indicators,
+                                            base, start_date, end_date,
+                                            cache=state.setdefault('indicator_cache', {}),
+                                            cache_key=(ticker, interval)):
+                    fig.add_trace(tr)
+            _stack_panes(fig)
+
+        # Re-apply hidden state (matches on the ticker name itself, or on the
+        # leading "<TICKER> " an indicator trace's name carries, so hiding a
+        # ticker also hides its indicator overlays).
         hidden_set = set(hidden_tickers or [])
         if hidden_set:
             fig.for_each_trace(
-                lambda t: t.update(visible='legendonly') if t.name in hidden_set else None
+                lambda t: t.update(visible='legendonly')
+                if (t.name in hidden_set or (t.name or '').split(' ', 1)[0] in hidden_set)
+                else None
             )
 
         return fig, count_text
+
+    @app.callback(
+        Output('trend-badges', 'children'),
+        [Input('ticker-dropdown', 'value'),
+         Input('reload-status', 'children')],
+    )
+    def update_trend_badges(selected_tickers, _reload_status):
+        """D/W/M trend chips for every selected ticker (from _load_data's trend_summary)."""
+        info = {t['value']: t for t in state['ticker_info']}
+        return [trend_badge(t, info.get(t, {}).get('trend')) for t in (selected_tickers or [])]
 
     @app.callback(
         Output('price-performance-graph', 'figure', allow_duplicate=True),
@@ -989,6 +1392,8 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
          Output('days-slider', 'max', allow_duplicate=True),
          Output('days-slider', 'value', allow_duplicate=True),
          Output('days-slider', 'marks', allow_duplicate=True),
+         Output('date-picker', 'min_date_allowed'),
+         Output('date-picker', 'max_date_allowed'),
          Output('reload-status', 'children')],
         [Input('reload-data-button', 'n_clicks'),
          Input('initial-load-trigger', 'n_intervals')],
@@ -999,7 +1404,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
         """Re-reads the CSV/DB from disk and refreshes the in-memory dataset used by all other callbacks."""
         new_data = _load_data(procedure_choice)
         if new_data is None:
-            return (dash.no_update,) * 7 + (
+            return (dash.no_update,) * 9 + (
                 f"Reload failed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - check server logs",
             )
 
@@ -1025,7 +1430,51 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
         slider_value = [max(0, max_days - 30), max_days - 1]
         status = f"Loaded at {state['loaded_at'].strftime('%Y-%m-%d %H:%M:%S')}"
 
-        return options, new_selection, theme_options, 0, max_days - 1, slider_value, marks, status
+        return (options, new_selection, theme_options, 0, max_days - 1, slider_value, marks,
+                df_melted['Date'].min().date(), df_melted['Date'].max().date(), status)
+
+    preset_ids = [f"range-{n}" for n in RANGE_PRESETS]
+
+    @app.callback(
+        [Output('days-slider', 'value', allow_duplicate=True),
+         Output('date-picker', 'start_date'),
+         Output('date-picker', 'end_date')]
+        + [Output(i, 'className') for i in preset_ids],
+        [Input(i, 'n_clicks') for i in preset_ids]
+        + [Input('date-picker', 'start_date'),
+           Input('date-picker', 'end_date'),
+           Input('days-slider', 'value')],
+        prevent_initial_call=True,
+    )
+    def sync_date_range(*args):
+        """Keeps the slider, the 30/90/180/360d presets and the calendar picker
+        in step. All three live in one callback because each is both an input
+        and an output of the others (Dash only allows that circularity within
+        a single callback). Slider values are day offsets from the first
+        loaded date; a preset means 'the last N days up to the newest date'."""
+        start_date, end_date, slider_value = args[len(preset_ids):]
+        min_date = state['df_melted']['Date'].min()
+        max_idx = state['max_days'] - 1
+        triggered = dash.callback_context.triggered[0]['prop_id'].split('.')[0] \
+            if dash.callback_context.triggered else ''
+
+        if triggered in preset_ids:
+            n = RANGE_PRESETS[preset_ids.index(triggered)]
+            value = [max(0, max_idx - n + 1), max_idx]
+        elif triggered == 'date-picker':
+            if not start_date or not end_date:
+                return (dash.no_update,) * (3 + len(preset_ids))
+            to_idx = lambda d: min(max((pd.Timestamp(d) - min_date).days, 0), max_idx)
+            value = sorted([to_idx(start_date), to_idx(end_date)])
+        else:
+            value = slider_value or [max(0, max_idx - 29), max_idx]
+
+        classes = ["range-btn active" if value == [max(0, max_idx - n + 1), max_idx] else "range-btn"
+                   for n in RANGE_PRESETS]
+        return ([value,
+                 (min_date + pd.Timedelta(days=value[0])).date(),
+                 (min_date + pd.Timedelta(days=value[1])).date()]
+                + classes)
 
     # Start the web server
     if not server:

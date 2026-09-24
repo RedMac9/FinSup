@@ -6,8 +6,10 @@
 //   {
 //     chartType: "candlestick" | "line",
 //     priceSeries: [ { ticker, type, color, data:[...] }, ... ],
-//     indicators:  [ { ticker, title, pane, type, color, data:[...] }, ... ]
+//     indicators:  [ { ticker, indicator, title, pane, type, color, data:[...] }, ... ]
 //   }
+//   type "band" -> data:[{start, end, top, bottom, color, label}] drawn as shaded
+//   rectangles attached to that ticker's price series (see BandsPrimitive).
 //
 // The chart instance is created once per container and cached on the DOM node so
 // changing selection / indicators preserves the user's zoom & pan.
@@ -67,6 +69,7 @@ window.dash_clientside = window.dash_clientside || {};
         state.allSeries = [];
         state.priceByTicker = {};
         state.priceList = [];
+        state.pendingMarkers = {};
     }
 
     function ensureTooltip(el) {
@@ -143,11 +146,104 @@ window.dash_clientside = window.dash_clientside || {};
         state.priceList.push({ ticker: ps.ticker, series: series, swatch: swatch, type: ps.type });
     }
 
+    // --- Bands (DiNapoli zones): shaded rectangles via the v4.1+ series
+    // primitive API. Each band starts at its own date and runs to the right
+    // edge of the pane, like the zones on the strategy document's charts.
+    function hexToRgba(hex, alpha) {
+        var h = (hex || "#64748b").replace("#", "");
+        if (h.length === 3) { h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2]; }
+        var n = parseInt(h, 16);
+        return "rgba(" + ((n >> 16) & 255) + "," + ((n >> 8) & 255) + "," + (n & 255) + "," + alpha + ")";
+    }
+
+    function BandsPrimitive(bands, opacity) {
+        var self = this;
+        this._bands = bands || [];
+        this._opacity = (opacity === undefined) ? 0.18 : opacity;
+        this._chart = null;
+        this._series = null;
+        this._view = {
+            zOrder: function () { return "bottom"; },
+            renderer: function () { return { draw: function (target) { self._draw(target); } }; },
+        };
+    }
+    BandsPrimitive.prototype.attached = function (p) { this._chart = p.chart; this._series = p.series; };
+    BandsPrimitive.prototype.detached = function () { this._chart = null; this._series = null; };
+    BandsPrimitive.prototype.updateAllViews = function () {};
+    BandsPrimitive.prototype.paneViews = function () { return [this._view]; };
+    BandsPrimitive.prototype._draw = function (target) {
+        var chart = this._chart, series = this._series, bands = this._bands, opacity = this._opacity;
+        if (!chart || !series) return;
+        var ts = chart.timeScale();
+        target.useBitmapCoordinateSpace(function (scope) {
+            var ctx = scope.context, hr = scope.horizontalPixelRatio, vr = scope.verticalPixelRatio;
+            var right = scope.bitmapSize.width;
+            bands.forEach(function (b) {
+                var yTop = series.priceToCoordinate(b.top);
+                var yBot = series.priceToCoordinate(b.bottom);
+                if (yTop === null || yBot === null) return;
+                var x0 = ts.timeToCoordinate(b.start);
+                if (x0 === null) x0 = 0;   // start is off the loaded data -> left edge
+                var y0 = Math.min(yTop, yBot) * vr;
+                var h = Math.max(Math.abs(yBot - yTop) * vr, 2 * vr);
+                var x = Math.max(0, x0 * hr);
+                ctx.fillStyle = hexToRgba(b.color, opacity);
+                ctx.fillRect(x, y0, right - x, h);
+                ctx.fillStyle = hexToRgba(b.color, 0.95);
+                ctx.font = (11 * vr) + "px sans-serif";
+                ctx.fillText(b.label || "", x + 4 * hr, y0 - 3 * vr);
+            });
+        });
+    };
+
+    // Sub-panes: Lightweight Charts v4 has no real panes, so every indicator
+    // with pane === "separate" gets its own price scale squeezed into a
+    // horizontal strip at the bottom; strips are stacked, never overlapped,
+    // and the main price scale is shrunk to leave room for them.
+    function layoutPanes(state, indicators) {
+        var keys = [];
+        (indicators || []).forEach(function (ind) {
+            if (ind.pane !== "separate") return;
+            var key = paneKey(ind);
+            if (keys.indexOf(key) < 0) keys.push(key);
+        });
+        var n = keys.length;
+        var strip = n ? Math.min(0.2, 0.45 / n) : 0;
+        state.paneMargins = {};
+        keys.forEach(function (key, i) {
+            // i = 0 is the top-most strip.
+            state.paneMargins[key] = {
+                top: 1 - (n - i) * strip + 0.01,
+                bottom: (n - i - 1) * strip,
+            };
+        });
+        state.chart.priceScale("right").applyOptions({
+            scaleMargins: { top: 0.05, bottom: n ? n * strip + 0.03 : 0.08 },
+        });
+    }
+
+    function paneKey(ind) {
+        // One strip per indicator per ticker (volume of two tickers has
+        // different scales, so they must not share a price scale).
+        return "pane_" + (ind.ticker || "") + "_" + (ind.indicator || ind.title);
+    }
+
     function addIndicator(state, ind) {
+        if (ind.type === "band") {
+            var host = state.priceByTicker[ind.ticker];
+            if (host && host.attachPrimitive && ind.data && ind.data.length) {
+                host.attachPrimitive(new BandsPrimitive(ind.data, ind.opacity));
+            }
+            return;
+        }
         if (ind.type === "markers") {
-            var target = state.priceByTicker[ind.ticker];
-            if (target && ind.data && ind.data.length) {
-                target.setMarkers(ind.data);
+            // Several marker-producing indicators can target the same ticker
+            // (e.g. "EMA32 cross" + "DiNapoli setups"); setMarkers() replaces
+            // a series' markers wholesale, so accumulate here and flush once
+            // per ticker after all indicators have been processed.
+            if (ind.data && ind.data.length) {
+                var list = state.pendingMarkers[ind.ticker] || [];
+                state.pendingMarkers[ind.ticker] = list.concat(ind.data);
             }
             return;
         }
@@ -157,14 +253,16 @@ window.dash_clientside = window.dash_clientside || {};
         if (ind.pane !== "separate") { assign(opts, percentFormat(state.normalized)); }
         var series;
         if (ind.pane === "separate") {
-            // Own price scale, parked in the lower portion to mimic a sub-pane.
-            var scaleId = "pane_" + ind.title;
+            // Own price scale, parked in its strip (see layoutPanes).
+            var scaleId = paneKey(ind);
             opts.priceScaleId = scaleId;
+            if (ind.type === "histogram") { delete opts.lineWidth; }
+            if (ind.indicator === "Volume") { opts.priceFormat = { type: "volume" }; }
             series = (ind.type === "histogram")
                 ? state.chart.addHistogramSeries(opts)
-                : state.chart.addLineSeries(opts);
+                : state.chart.addLineSeries(assign(opts, { lineWidth: 1 }));
             state.chart.priceScale(scaleId).applyOptions({
-                scaleMargins: { top: 0.78, bottom: 0 },
+                scaleMargins: state.paneMargins[scaleId] || { top: 0.78, bottom: 0 },
                 borderColor: "#cbd5e1",
             });
         } else {
@@ -205,8 +303,18 @@ window.dash_clientside = window.dash_clientside || {};
             return noUpdate;
         }
 
+        var indicators = (data && data.indicators) || [];
+        layoutPanes(state, indicators);
         priceSeries.forEach(function (ps) { addPriceSeries(state, ps, multi); });
-        ((data && data.indicators) || []).forEach(function (ind) { addIndicator(state, ind); });
+        indicators.forEach(function (ind) { addIndicator(state, ind); });
+        Object.keys(state.pendingMarkers || {}).forEach(function (ticker) {
+            var target = state.priceByTicker[ticker];
+            if (!target) return;
+            var merged = state.pendingMarkers[ticker].slice().sort(function (a, b) {
+                return a.time < b.time ? -1 : (a.time > b.time ? 1 : 0);
+            });
+            target.setMarkers(merged);
+        });
         updateLegend(el, priceSeries, multi);
 
         return noUpdate;

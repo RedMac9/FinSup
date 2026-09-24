@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
@@ -49,13 +50,99 @@ def get_market_info(tickers, max_workers=20):
 
     return market_info_dict
 
-def download_ohlc_to_csv(tickers, csv_filename, days=181):
-    """Download daily OHLC for `tickers` and write it to `csv_filename` (wide format).
+# How much daily history the chart CSVs (historical_prices_*.csv) hold. The
+# DiNapoli engine needs years, not months: MA200, weekly/monthly swings and
+# weekly/monthly Fibo levels are meaningless on ~125 bars (the old 181 days).
+# The tail-based metrics below (DaysCloseAbove..._LastN, ATH10/30, pct change)
+# are unaffected by the longer window.
+HISTORY_DAYS = 3 * 365
+
+OHLCV = ['Open', 'High', 'Low', 'Close', 'Volume']
+
+# Yahoo intermittently returns nothing for single tickers ("possibly
+# delisted") inside a large batch, even though the same ticker downloads fine
+# seconds later. Such tickers are re-requested this many times, after a
+# short pause, before being given up on.
+DOWNLOAD_RETRIES = 2
+DOWNLOAD_RETRY_PAUSE_S = 3.0
+
+
+def _empty_tickers(data, tickers):
+    """Tickers with no usable Close in a yf.download(group_by='ticker') result."""
+    if data is None or data.empty:
+        return list(tickers)
+    if not isinstance(data.columns, pd.MultiIndex):
+        # Single-ticker download comes back with flat columns.
+        close = data.get('Close')
+        return list(tickers) if close is None or close.dropna().empty else []
+    present = set(data.columns.get_level_values(0))
+    return [t for t in tickers
+            if t not in present or (t, 'Close') not in data.columns
+            or data[(t, 'Close')].dropna().empty]
+
+
+def _yf_download(tickers, start_date, end_date):
+    """yf.download() with a retry of just the tickers that came back empty.
+
+    Always re-downloads the full window (no delta/merge): Yahoo's OHLC is
+    split-adjusted retroactively, so appending new rows to an old CSV would
+    put pre- and post-split prices on different scales, and a short window
+    saves little anyway - the cost is per ticker request, not per day
+    (measured: 200 tickers, 3y 15.5s vs 10d 11.6s).
+    """
+    kwargs = dict(start=start_date, end=end_date, auto_adjust=False, group_by='ticker')
+    data = yf.download(tickers, **kwargs)
+
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        missing = _empty_tickers(data, tickers)
+        if not missing:
+            break
+        print(f"yfinance: {len(missing)} ticker(s) empty, retry {attempt}/{DOWNLOAD_RETRIES}: "
+              f"{', '.join(missing[:15])}{' ...' if len(missing) > 15 else ''}")
+        time.sleep(DOWNLOAD_RETRY_PAUSE_S)
+        try:
+            again = yf.download(missing, **kwargs)
+        except Exception as e:
+            print(f"yfinance: retry {attempt} failed: {e}")
+            continue
+        if again is None or again.empty:
+            continue
+        if data is None or data.empty or not isinstance(data.columns, pd.MultiIndex):
+            data = again   # nothing (usable) from the first pass, or single ticker
+            continue
+        if not isinstance(again.columns, pd.MultiIndex):
+            again.columns = pd.MultiIndex.from_product([[missing[0]], again.columns])
+        data = pd.concat([data.drop(columns=missing, level=0, errors='ignore'), again], axis=1)
+
+    still = _empty_tickers(data, tickers)
+    if still and len(still) < len(tickers):
+        print(f"yfinance: no data after {DOWNLOAD_RETRIES} retries for: {', '.join(still)}")
+    return data
+
+
+def _flatten_ohlcv(tickers_data, tickers):
+    """yf.download() output -> wide frame with Open_T / High_T / Low_T / Close_T /
+    Volume_T columns (alphabetical), indexed by 'Date'."""
+    if isinstance(tickers_data.columns, pd.MultiIndex):
+        ohlc_data = tickers_data.loc[:, tickers_data.columns.get_level_values(1).isin(OHLCV)]
+        ohlc_data.columns = [f'{price_type}_{ticker}' for ticker, price_type in ohlc_data.columns]
+    else:
+        single_ticker = tickers[0]
+        cols = [c for c in OHLCV if c in tickers_data.columns]
+        ohlc_data = tickers_data[cols].copy()
+        ohlc_data.columns = [f'{col}_{single_ticker}' for col in ohlc_data.columns]
+    ohlc_data = ohlc_data.reindex(sorted(ohlc_data.columns), axis=1)
+    ohlc_data.index.name = 'Date'
+    return ohlc_data
+
+
+def download_ohlc_to_csv(tickers, csv_filename, days=HISTORY_DAYS):
+    """Download daily OHLCV for `tickers` and write it to `csv_filename` (wide format).
 
     Lightweight refresh used by the positions chart: same download + flatten logic
-    as metrics_separate_tabs (Open_TICKER / High_TICKER / Low_TICKER / Close_TICKER,
-    indexed by Date), but without the technical-metric computation. Returns True on
-    success, False if nothing was downloaded.
+    as metrics_separate_tabs (Open_TICKER / High_TICKER / Low_TICKER / Close_TICKER /
+    Volume_TICKER, indexed by Date), but without the technical-metric computation.
+    Returns True on success, False if nothing was downloaded.
     """
     if not tickers:
         print("download_ohlc_to_csv: no tickers given, skipping.")
@@ -65,10 +152,7 @@ def download_ohlc_to_csv(tickers, csv_filename, days=181):
     start_date = end_date - timedelta(days=days)
 
     try:
-        tickers_data = yf.download(
-            tickers, start=start_date, end=end_date,
-            auto_adjust=False, group_by='ticker',
-        )
+        tickers_data = _yf_download(tickers, start_date, end_date)
     except Exception as e:
         print(f"download_ohlc_to_csv: yfinance error: {e}")
         return False
@@ -77,16 +161,7 @@ def download_ohlc_to_csv(tickers, csv_filename, days=181):
         print("download_ohlc_to_csv: no data returned.")
         return False
 
-    if isinstance(tickers_data.columns, pd.MultiIndex):
-        ohlc_data = tickers_data.loc[:, tickers_data.columns.get_level_values(1).isin(['Open', 'High', 'Low', 'Close'])]
-        ohlc_data.columns = [f'{price_type}_{ticker}' for ticker, price_type in ohlc_data.columns]
-    else:
-        single_ticker = tickers[0]
-        ohlc_data = tickers_data[['Open', 'High', 'Low', 'Close']].copy()
-        ohlc_data.columns = [f'{col}_{single_ticker}' for col in ohlc_data.columns]
-
-    ohlc_data = ohlc_data.reindex(sorted(ohlc_data.columns), axis=1)
-    ohlc_data.index.name = 'Date'
+    ohlc_data = _flatten_ohlcv(tickers_data, tickers)
     ohlc_data.to_csv(csv_filename)
     print(f"download_ohlc_to_csv: wrote {csv_filename} ({len(ohlc_data)} rows, {len(tickers)} tickers).")
     return True
@@ -101,17 +176,12 @@ def metrics_separate_tabs(tickers, procedure_choice, market_mappings):
 
     # Krok 1: Pobieranie danych historycznych
     end_date = datetime.now()
-    # Pobieramy dane z jednego dnia więcej, aby mieć pewność, że mamy dane do obliczenia pct_change()
-    start_date = end_date - timedelta(days=181)
+    # Długa historia - potrzebna wykresom (MA200, trend W/M, poziomy DiNapoli);
+    # metryki poniżej liczą z ogona serii, więc długość okna ich nie zmienia.
+    start_date = end_date - timedelta(days=HISTORY_DAYS)
 
     try:
-        tickers_data = yf.download(
-            tickers,
-            start=start_date,
-            end=end_date,
-            auto_adjust=False,
-            group_by='ticker'
-        )
+        tickers_data = _yf_download(tickers, start_date, end_date)
     except Exception as e:
         print(f"Wystąpił błąd podczas pobierania danych z yfinance: {e}")
         return pd.DataFrame()
@@ -124,24 +194,11 @@ def metrics_separate_tabs(tickers, procedure_choice, market_mappings):
     # This section processes and saves the downloaded OHLC data to a CSV file,
     # which is required by the graph.py script.
 
-    # 1. Select OHLC columns. Handle both MultiIndex (multiple tickers) and single Index (one ticker).
-    if isinstance(tickers_data.columns, pd.MultiIndex):
-        ohlc_data = tickers_data.loc[:, tickers_data.columns.get_level_values(1).isin(['Open', 'High', 'Low', 'Close'])]
-        # 2. Flatten column names from ('TICKER', 'Metric') to 'Metric_TICKER' (e.g., 'Close_AAPL').
-        ohlc_data.columns = [f'{price_type}_{ticker}' for ticker, price_type in ohlc_data.columns]
-    else:
-        # Handle the case for a single ticker download.
-        if not tickers:
-             return pd.DataFrame() # Return empty if no tickers
-        single_ticker = tickers[0]
-        ohlc_data = tickers_data[['Open', 'High', 'Low', 'Close']].copy()
-        ohlc_data.columns = [f'{col}_{single_ticker}' for col in ohlc_data.columns]
-
-    # 3. Reorder columns alphabetically for consistency.
-    ohlc_data = ohlc_data.reindex(sorted(ohlc_data.columns), axis=1)
-
-    # 4. Name the index 'Date' as expected by the graphing script.
-    ohlc_data.index.name = 'Date'
+    # 1-4. Select OHLCV, flatten ('TICKER', 'Metric') -> 'Metric_TICKER'
+    # (e.g. 'Close_AAPL'), sort columns and name the index 'Date'.
+    if not tickers:
+        return pd.DataFrame()
+    ohlc_data = _flatten_ohlcv(tickers_data, tickers)
 
     # 5. Save data to the appropriate CSV file based on procedure_choice.
     # The choice determines the output filename for different market data sets (SP500, GPW, etc.)[2].

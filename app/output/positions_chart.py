@@ -25,7 +25,8 @@ from dash.dependencies import Input, Output, State
 import pandas as pd
 
 from tickers_lists.ticker_groups import payloadPROD_db, payload_reit_db
-from services.indicators import INDICATORS, compute_indicators
+from services.indicators import DINAPOLI_DEFAULTS, INDICATORS, compute_indicators, resample_ohlc
+from services.dinapoli_overlay import trend_summary
 from services.market_metrics import download_ohlc_to_csv
 
 # OHLC produced by procedure 4/7 (market_metrics.metrics_separate_tabs).
@@ -56,11 +57,13 @@ def _read_csv():
 
 
 def load_ohlc(ticker, raw=None):
-    """Return a tidy ascending OHLC DataFrame (Date, Open, High, Low, Close) for one ticker.
+    """Return a tidy ascending OHLC DataFrame (Date, Open, High, Low, Close[, Volume])
+    for one ticker.
 
-    Slices the wide historical_prices_PROD.csv (Open_T / High_T / Low_T / Close_T)
-    and drops rows missing any OHLC value. `raw` lets a caller pass an already-read
-    CSV to avoid re-reading per ticker. Returns an empty frame on any problem.
+    Slices the wide historical_prices_PROD.csv (Open_T / High_T / Low_T / Close_T,
+    plus Volume_T when the CSV has it) and drops rows missing any OHLC value. `raw`
+    lets a caller pass an already-read CSV to avoid re-reading per ticker. Returns
+    an empty frame on any problem.
     """
     cols = ["Date", "Open", "High", "Low", "Close"]
     if not ticker:
@@ -73,6 +76,8 @@ def load_ohlc(ticker, raw=None):
     missing = [c for c in wide_cols if c not in df.columns]
     if "Date" not in df.columns or missing:
         return pd.DataFrame(columns=cols)
+    if f"Volume_{ticker}" in df.columns:
+        wide_cols[f"Volume_{ticker}"] = "Volume"
 
     out = df[["Date"] + list(wide_cols.keys())].rename(columns=wide_cols)
     out["Date"] = pd.to_datetime(out["Date"])
@@ -150,6 +155,23 @@ def order_by_ath30(tickers, raw=None):
     return sorted(tickers, key=lambda t: (t not in pct, pct.get(t, 0.0)))
 
 
+TREND_ARROWS = {"wzrostowy": ("↑", "up"), "spadkowy": ("↓", "down"), "boczny": ("→", "side")}
+
+
+def trend_badge(ticker, trend):
+    """'AAPL  D↑ W↓ M→ · kontekst wzrostowy' as coloured chips (see positions.css)."""
+    if not trend:
+        return html.Span([html.B(ticker), " brak danych"], className="trend-badge")
+    chips = []
+    for tf in ("D", "W", "M"):
+        arrow, cls = TREND_ARROWS.get(trend[tf], ("?", "side"))
+        chips.append(html.Span(f"{tf}{arrow}", className=f"trend-chip trend-{cls}",
+                               title=f"trend {tf}: {trend[tf]}"))
+    return html.Span([html.B(ticker)] + chips
+                     + [html.Span(trend["context"], className="trend-context")],
+                     className="trend-badge")
+
+
 def _ticker_options(tickers, raw=None, reit_set=None):
     """Sidebar checklist options: 'TICKER  +1.2%' with red/green colouring."""
     pct = daily_pct_changes(tickers, raw=raw)
@@ -189,7 +211,8 @@ def positions_chart_start(server=None):
     reit_set = payload_reit_db()
     ordered_positions = order_by_ath30(open_positions)
     default_selection = ordered_positions[:1]
-    default_indicators = [name for name, spec in INDICATORS.items() if spec["default_on"]]
+    # Single-ticker candle view -> DiNapoli layer set from the strategy document.
+    default_indicators = list(DINAPOLI_DEFAULTS)
     all_indicator_names = list(INDICATORS.keys())
 
     # Refresh state: download fresh OHLC once per process (so the first chart view
@@ -250,6 +273,20 @@ def positions_chart_start(server=None):
                             html.Div(
                                 className="pos-control",
                                 children=[
+                                    html.Span("Interval", className="pos-label"),
+                                    dcc.RadioItems(
+                                        id="pos-interval",
+                                        options=[{"label": "D", "value": "D"},
+                                                 {"label": "W", "value": "W"}],
+                                        value="D",
+                                        inline=True,
+                                        className="pos-radio",
+                                    ),
+                                ],
+                            ),
+                            html.Div(
+                                className="pos-control",
+                                children=[
                                     html.Span("Scale", className="pos-label"),
                                     dcc.Checklist(
                                         id="pos-normalize",
@@ -295,6 +332,7 @@ def positions_chart_start(server=None):
                             html.Span(id="pos-status", className="pos-status"),
                         ],
                     ),
+                    html.Div(id="pos-trend", className="pos-trend-row"),
                     html.Div(
                         className="pos-chart-wrap",
                         children=[html.Div(id="tv-chart")],
@@ -350,16 +388,18 @@ def positions_chart_start(server=None):
     @app.callback(
         [Output("tv-chart-data", "data"),
          Output("pos-status", "children"),
-         Output("pos-ticker-list", "options")],
+         Output("pos-ticker-list", "options"),
+         Output("pos-trend", "children")],
         [Input("pos-ticker-list", "value"),
          Input("pos-indicators", "value"),
          Input("pos-candles", "value"),
          Input("pos-normalize", "value"),
          Input("pos-hide-reit", "value"),
-         Input("pos-refresh", "n_clicks")],
+         Input("pos-refresh", "n_clicks"),
+         Input("pos-interval", "value")],
     )
     def build_chart_data(selected, selected_indicators, candles_value, normalize_value,
-                         hide_reit_value, refresh_clicks):
+                         hide_reit_value, refresh_clicks, interval):
         ctx = dash.callback_context
         triggered = ctx.triggered[0]["prop_id"].split(".")[0] if ctx.triggered else ""
 
@@ -393,10 +433,15 @@ def positions_chart_start(server=None):
 
         price_series = []
         indicators_out = []
+        badges = []
         for i, ticker in enumerate(selected):
             df = load_ohlc(ticker, raw=raw)
             if df.empty:
                 continue
+            # D/W/M trend always comes from daily data, whatever is displayed.
+            badges.append(trend_badge(ticker, trend_summary(df)))
+            if interval == "W":
+                df = resample_ohlc(df, "W")
             color = PALETTE[i % len(PALETTE)]
             base = float(df["Close"].iloc[0]) if normalize else None
             if base:  # normalized line: rebased to % change from day 0
@@ -412,7 +457,11 @@ def positions_chart_start(server=None):
                 # Rebase price-based (main-pane) indicators onto the same % scale
                 # so SMA/EMA/ATH stay aligned with the normalized price line.
                 if base and s["pane"] == "main" and s["type"] in ("line", "histogram"):
-                    s["data"] = [{"time": d["time"], "value": (d["value"] / base - 1.0) * 100.0}
+                    s["data"] = [dict(d, value=(d["value"] / base - 1.0) * 100.0)
+                                 for d in s["data"]]
+                elif base and s["type"] == "band":
+                    s["data"] = [dict(d, top=(d["top"] / base - 1.0) * 100.0,
+                                      bottom=(d["bottom"] / base - 1.0) * 100.0)
                                  for d in s["data"]]
                 if multi and s["type"] != "markers":
                     s["title"] = f"{ticker} {s['title']}"
@@ -420,7 +469,7 @@ def positions_chart_start(server=None):
 
         data = {"chartType": chart_type, "normalized": normalize,
                 "priceSeries": price_series, "indicators": indicators_out}
-        return data, status, options
+        return data, status, options, badges
 
     # Hand the payload to Lightweight Charts (see assets_positions/tv_chart.js).
     app.clientside_callback(

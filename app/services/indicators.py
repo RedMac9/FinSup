@@ -7,26 +7,60 @@ Charts) knows how to draw. Adding a new indicator is just: write a function,
 add one entry to INDICATORS. No chart-code changes required.
 
 Expected OHLC DataFrame (ascending by date):
-    columns -> Date (datetime64), Open, High, Low, Close
+    columns -> Date (datetime64), Open, High, Low, Close, optional Volume
 
 Series dict contract (one indicator may return several series):
     {
         "title": str,                       # legend label
-        "pane":  "main" | "separate",       # main price scale, or its own
-        "type":  "line" | "histogram" | "markers",
+        "pane":  "main" | "separate",       # main price scale, or its own sub-pane
+        "type":  "line" | "histogram" | "markers" | "band",
         "color": "#rrggbb",
-        "data":  [...]                       # see below per type
+        "data":  [...],                      # see below per type
+        "indicator": str,                   # registry name - set by compute_indicators()
     }
 
-    line / histogram data -> [{"time": "YYYY-MM-DD", "value": float}, ...]
+    line / histogram data -> [{"time": "YYYY-MM-DD", "value": float,
+                               "color": str (optional, histogram only)}, ...]
     markers data          -> [{"time": "YYYY-MM-DD", "position": "aboveBar"|"belowBar",
                                "color": str, "shape": "arrowUp"|"arrowDown"|"circle",
                                "text": str}, ...]
+    band data             -> [{"start": "YYYY-MM-DD", "end": "YYYY-MM-DD",
+                               "top": float, "bottom": float, "color": str,
+                               "label": str, "detail": str}, ...]
+                             (+ series-level "opacity": float) - shaded price
+                             rectangles, e.g. DiNapoli zones.
 
-Markers are attached to the main candlestick series by the front-end.
+Markers are attached to the main candlestick series by the front-end. Every
+"separate" series of one indicator shares one sub-pane.
 """
 
 import pandas as pd
+
+from services.dinapoli_overlay import (
+    dinapoli_breakouts, dinapoli_dma, dinapoli_failures, dinapoli_levels,
+    dinapoli_macd_predictor, dinapoli_overbought_oversold, dinapoli_setups,
+    dinapoli_zones, dinapoli_zones_all,
+)
+
+# Volume spike = volume at least this many times its VOLUME_AVG_WINDOW-day
+# average ("na większych obrotach" in the strategy document).
+VOLUME_AVG_WINDOW = 20
+VOLUME_SPIKE_MULT = 1.8
+
+
+def resample_ohlc(df, rule="W"):
+    """Tidy daily (Date, Open, High, Low, Close[, Volume]) -> the same shape on
+    a higher interval. Each candle is dated by its LAST actual session (not the
+    period-end calendar date), so it lines up with daily dates and never lands
+    in the future for the unfinished current week."""
+    if df is None or df.empty:
+        return df
+    agg = {"Date": "last", "Open": "first", "High": "max", "Low": "min", "Close": "last"}
+    if "Volume" in df.columns:
+        agg["Volume"] = "sum"
+    out = (df.set_index(pd.DatetimeIndex(pd.to_datetime(df["Date"])), drop=False)
+             .resample(rule).agg(agg))
+    return out.dropna(subset=["Close"]).reset_index(drop=True)
 
 
 def _time_str(series_index) -> list:
@@ -84,6 +118,78 @@ def ema32(df):
     return _ema(df, 32, "#ef4444")
 
 
+def sma100(df):
+    return _sma(df, 100, "#15803d")
+
+
+def sma200(df):
+    return _sma(df, 200, "#1d4ed8")
+
+
+def volume(df):
+    """Volume bars in their own pane, green on up-candles and red on down."""
+    if "Volume" not in df.columns:
+        return []
+    times = _time_str(df["Date"])
+    data = [
+        {"time": t, "value": float(v),
+         "color": "#86efac" if c >= o else "#fca5a5"}
+        for t, v, o, c in zip(times, df["Volume"], df["Open"], df["Close"])
+        if pd.notna(v)
+    ]
+    avg = df["Volume"].rolling(VOLUME_AVG_WINDOW).mean()
+    return [
+        {"title": "Volume", "pane": "separate", "type": "histogram",
+         "color": "#94a3b8", "data": data},
+        _line_series(df, avg, f"Vol avg{VOLUME_AVG_WINDOW}", "#475569", pane="separate"),
+    ]
+
+
+def volume_spikes(df):
+    """Markers on bars whose volume is >= VOLUME_SPIKE_MULT x its average."""
+    if "Volume" not in df.columns:
+        return []
+    ratio = df["Volume"] / df["Volume"].rolling(VOLUME_AVG_WINDOW).mean()
+    times = _time_str(df["Date"])
+    markers = []
+    for t, r, o, c in zip(times, ratio, df["Open"], df["Close"]):
+        if pd.notna(r) and r >= VOLUME_SPIKE_MULT:
+            up = c >= o
+            markers.append({"time": t, "position": "belowBar" if up else "aboveBar",
+                            "color": "#0369a1", "shape": "circle",
+                            "text": f"Vol×{r:.1f}"})
+    return [{"title": "Volume spikes", "pane": "main", "type": "markers",
+             "color": "#0369a1", "data": markers}]
+
+
+def gaps(df):
+    """Luka hossy (low above previous high) / luka bessy (high below previous low)."""
+    prev_high, prev_low = df["High"].shift(1), df["Low"].shift(1)
+    times = _time_str(df["Date"])
+    markers = []
+    for t, lo, hi, ph, pl in zip(times, df["Low"], df["High"], prev_high, prev_low):
+        if pd.notna(ph) and lo > ph:
+            markers.append({"time": t, "position": "belowBar", "color": "#16a34a",
+                            "shape": "circle", "text": "luka hossy"})
+        elif pd.notna(pl) and hi < pl:
+            markers.append({"time": t, "position": "aboveBar", "color": "#dc2626",
+                            "shape": "circle", "text": "luka bessy"})
+    return [{"title": "Gaps", "pane": "main", "type": "markers",
+             "color": "#16a34a", "data": markers}]
+
+
+def volume_ratio(df):
+    """Last bar's volume / its VOLUME_AVG_WINDOW-day average (None if unknown).
+    Screener helper, not a chart layer."""
+    if df is None or "Volume" not in df.columns or len(df) < VOLUME_AVG_WINDOW:
+        return None
+    avg = df["Volume"].rolling(VOLUME_AVG_WINDOW).mean().iloc[-1]
+    last = df["Volume"].iloc[-1]
+    if pd.isna(avg) or not avg or pd.isna(last):
+        return None
+    return float(last / avg)
+
+
 def ath30_line(df):
     """30-day rolling all-time-high overlaid on price."""
     ath30 = df["Close"].rolling(window=30, min_periods=1).max()
@@ -127,13 +233,40 @@ INDICATORS = {
     "SMA10": {"func": sma10, "default_on": False},
     "SMA20": {"func": sma20, "default_on": True},
     "SMA50": {"func": sma50, "default_on": False},
+    "SMA100": {"func": sma100, "default_on": False},
+    "SMA200": {"func": sma200, "default_on": False},
     "EMA10": {"func": ema10, "default_on": False},
     "EMA20": {"func": ema20, "default_on": False},
     "EMA32": {"func": ema32, "default_on": True},
     "ATH30": {"func": ath30_line, "default_on": False},
     "% from ATH30": {"func": pct_from_ath30, "default_on": False},
     "EMA32 cross": {"func": ema32_cross_markers, "default_on": False},
+    "Volume": {"func": volume, "default_on": False},
+    "Volume spikes": {"func": volume_spikes, "default_on": False},
+    "Gaps": {"func": gaps, "default_on": False},
+    # DiNapoli confluence/levels system - logic lives in services/dinapoli/,
+    # all tuning (fib ratios, tolerances, colors, scan window) in
+    # services/dinapoli_settings.py. See services/dinapoli_overlay.py for the
+    # translation into these series dicts.
+    "DiNapoli Zones": {"func": dinapoli_zones, "default_on": False},
+    "DiNapoli Zones (all)": {"func": dinapoli_zones_all, "default_on": False},
+    "DiNapoli Levels": {"func": dinapoli_levels, "default_on": False},
+    "DiNapoli DMA": {"func": dinapoli_dma, "default_on": False},
+    "DiNapoli MacdPred": {"func": dinapoli_macd_predictor, "default_on": False},
+    "DiNapoli OB/OS": {"func": dinapoli_overbought_oversold, "default_on": False},
+    "DiNapoli Setups": {"func": dinapoli_setups, "default_on": False},
+    "DiNapoli Failures": {"func": dinapoli_failures, "default_on": False},
+    "DiNapoli Breakouts": {"func": dinapoli_breakouts, "default_on": False},
 }
+
+# Default layer set for DiNapoli-style single-ticker views (the open-positions
+# chart): what the strategy document's charts show - MA50/100/200, DMA 3x3 &
+# 25x5, the nearest zones, setups, volume. The screener's short-term averages
+# (SMA10/20, EMA10/20/32, ATH30) stay available but start off there.
+DINAPOLI_DEFAULTS = [
+    "SMA50", "SMA100", "SMA200", "DiNapoli DMA", "DiNapoli Zones",
+    "DiNapoli Setups", "Volume",
+]
 
 
 def compute_indicators(df, selected_names):
@@ -148,7 +281,9 @@ def compute_indicators(df, selected_names):
         if not spec:
             continue
         try:
-            out.extend(spec["func"](df))
+            for s in spec["func"](df):
+                s["indicator"] = name
+                out.append(s)
         except Exception as exc:  # pragma: no cover - defensive
             print(f"Indicator '{name}' failed: {exc}")
     return out

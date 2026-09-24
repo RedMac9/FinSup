@@ -45,7 +45,7 @@ The app runs from `FinRep2/` as the working directory — all relative paths (se
 **Core data pipeline** (procedure 4 is the canonical full run):
 1. `exchange_rate.py` — fetches PLN rates from NBP API, saves to `exchange_rates.csv` and PostgreSQL
 2. `tickers_lists/ticker_groups.py` — scrapes tickers dynamically (GPW from biznesradar.pl, S&P500 from Wikipedia)
-3. `services/market_metrics.py:metrics_separate_tabs()` — bulk-downloads 6 months of OHLC via `yf.download()`, computes SMA/EMA/ATH metrics for each ticker, saves OHLC to a CSV (`historical_prices_PROD.csv` etc.), returns a flat DataFrame also saved to `final_df_metrics.csv`
+3. `services/market_metrics.py:metrics_separate_tabs()` — bulk-downloads ~3 years of daily OHLCV (`HISTORY_DAYS`) via `yf.download()`, computes SMA/EMA/ATH metrics for each ticker, saves OHLC to a CSV (`historical_prices_PROD.csv` etc.), returns a flat DataFrame also saved to `final_df_metrics.csv`
 4. `services/database_service.py` — upserts metrics into PostgreSQL (`tickers_metrics` table), reads `v_open_positions_metrics` and `v_roi_summary` views
 5. `services/google_gsheet.py` — writes DataFrames to Google Sheets (hardcoded `SPREADSHEET_ID`)
 6. `services/daily_pushbullet.py` — sends a Pushbullet notification
@@ -60,3 +60,7 @@ The app runs from `FinRep2/` as the working directory — all relative paths (se
 **market_config.py**: Maps yfinance exchange codes (`NYQ`, `WSE`, `NMS`, etc.) to TradingView market prefixes used to build chart URLs.
 
 **Notable files to ignore**: `app/services/FULL_MARKETS_*.py` and `app/main_div_toberemoved.py` are legacy/archived scripts not part of the active pipeline.
+
+## Rules
+
+- **Versioning `app/output/graph.py`**: the module carries `__version__` (semver) plus a short history comment at the top of the file. Every change to the file must bump it — MAJOR for breaking layout/behaviour changes, MINOR for new features, PATCH for fixes — and add a one-line history entry. The version is shown in the dashboard top bar so the running version can be verified.
