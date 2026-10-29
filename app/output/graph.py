@@ -14,18 +14,53 @@
 #           re-opens it while hidden
 #   1.4.0 - Date Range: 30/90/180/360-day preset buttons and a calendar
 #           range picker, kept in sync with the slider
-__version__ = "1.4.0"
+#   1.5.0 - new data set: procedure 10 = US (NYSE + NASDAQ ex S&P 500)
+#   1.5.1 - speed: page open reuses loaded data unless the CSV changed, derived
+#           data cached on disk (*.graphcache.pkl), vectorized price-change and
+#           ATH-drop filters; long-format frames dropped after load (only
+#           first/last date kept)
+#   1.6.0 - Steady uptrend screener: log-regression trend growth, downside-only
+#           deviation, max drawdown / daily drop limits, up/down ratio, Sortino,
+#           momentum flag and score; results table under the chart
+#   1.7.0 - Steady uptrend: trend growth threshold/score per 90 days (annual
+#           kept as a column), defaults tuned for a 3-month horizon
+#   1.8.0 - Apply button (drawer + top bar) with a Live update switch, off by
+#           default: filters, ticker selection and chart controls wait for
+#           Apply; Steady uptrend score combines separate 30d/90d/1y trends;
+#           "Table: all tickers" option shows failing tickers and why
+#   1.9.0 - Chart switch (top bar): chart and trend badges are only built while
+#           it is on, so large selections fill the table without drawing;
+#           hover help on filters, controls and table columns; explicit max on
+#           every number input (Dash 4.3 stepper blanked inputs without one);
+#           Live update off: Apply trims the selection to the filtered list and
+#           redraws from it (chart kept showing tickers no longer selected),
+#           Apply no longer stays "pending" after page open / Apply; decimal
+#           inputs step 0.1 (off-step typed values were sent as None) and
+#           invalid inputs are outlined red
+#   1.10.0 - defaults: Live update on, Chart off; -/+ steps by whole numbers on
+#           every number input (step "any": typed decimals stay valid)
+#   1.11.0 - Steady uptrend table: row highlight on hover, click a row to pin
+#           its highlight (click again to unpin); Ticker links to TradingView
+__version__ = "1.11.0"
 
 from datetime import datetime
+from pathlib import Path
+import threading
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import dash
-from dash import dcc, html
+from dash import dcc, html, dash_table
 from dash.dependencies import Input, Output, State
+from dash.exceptions import PreventUpdate
 from tickers_lists.ticker_groups import payloadPROD_db
 from services.indicators import INDICATORS, compute_indicators, resample_ohlc, volume_ratio
 from services.dinapoli_overlay import trend_summary
+from services.steady_trend import (STEADY_TREND_PARAMS, STEADY_TREND_COLUMNS, steady_trend_metrics,
+                                   score_steady_trend, steady_trend_rows, STEADY_TREND_PARAM_HELP,
+                                   STEADY_TREND_COLUMN_HELP)
+from services.market_metrics import _load_exchange_cache
+from services.market_config import market_mappings
 from output.positions_chart import TREND_ARROWS, trend_badge
 
 ALL_METRICS = ['Close', 'Open', 'High', 'Low']
@@ -37,6 +72,22 @@ TREND_OPTIONS = [{'label': 'any', 'value': 'any'},
                  {'label': '→ boczny', 'value': 'boczny'}]
 ALL_INDICATOR_NAMES = list(INDICATORS.keys())
 DEFAULT_INDICATOR_NAMES = [name for name, spec in INDICATORS.items() if spec["default_on"]]
+
+# Procedure choice -> price CSV (relative to the working directory).
+DATA_FILES = {
+    "5": "historical_prices_GPW.csv",
+    "6": "historical_prices_SP500.csv",
+    "10": "historical_prices_US.csv",
+    "7": "historical_prices_PROD.csv",
+    "13": "historical_prices_ETF.csv",
+}
+ETF_DETAILS_FILE = 'app/tests/ETF.csv'
+
+# Code whose output is in the disk cache - editing any of it invalidates the cache.
+_APP_DIR = Path(__file__).resolve().parent.parent
+_CACHE_CODE_FILES = [Path(__file__), _APP_DIR / 'services' / 'indicators.py',
+                     _APP_DIR / 'services' / 'dinapoli_overlay.py',
+                     *sorted((_APP_DIR / 'services' / 'dinapoli').glob('*.py'))]
 
 
 # --- Helper Functions ---
@@ -65,18 +116,231 @@ def _create_filter_slider(label_text, slider_id, min_val, max_val, step, value, 
     ], style=style or {})
 
 
-def _load_data(procedure_choice):
-    """Reads the CSVs and DB fresh and returns a dict of everything the Dash layout/callbacks need."""
-    # --- 1. Data Loading and Preparation ---
-    open_positions = payloadPROD_db()
+# Apply buttons (drawer + top bar). With Live update off, the filter and chart
+# callbacks only run when one of APPLY_TRIGGERS fired.
+APPLY_BUTTONS = ['apply-filters-button', 'apply-top-button']
+# 'filter-applied' is stamped by the filter callback each time it applies, in the
+# same response as the selection it trimmed to the new ticker list.
+APPLY_TRIGGERS = {*APPLY_BUTTONS, 'live-update-toggle', 'reload-status', 'chart-enable', 'filter-applied'}
+APPLY_CLASS = "btn-tonal apply-btn"
 
-    # Map procedure choice to data files
-    file_map = {
-        "5": "historical_prices_GPW.csv",
-        "6": "historical_prices_SP500.csv",
-        "7": "historical_prices_PROD.csv",
-        "13": "historical_prices_ETF.csv",
-    }
+
+def _apply_blocked(live_update):
+    """True when Live update is off and this callback run was not caused by an
+    Apply button, the Live toggle or a data reload (initial calls always run)."""
+    triggered = set(dash.callback_context.triggered_prop_ids.values())
+    return 'enabled' not in (live_update or []) and bool(triggered) and not (triggered & APPLY_TRIGGERS)
+
+
+# Step of every number input. "any" makes Dash 4.3's -/+ stepper move by 1 and
+# round to a whole number, while any typed decimal stays valid - with a numeric
+# step, a typed value off the step grid is invalid for the browser and Dash then
+# sends None, i.e. the filter silently uses its default.
+NUMBER_STEP = "any"
+
+# Steady uptrend inputs: (param key, label); initial values from STEADY_TREND_PARAMS.
+STEADY_TREND_INPUTS = [
+    ('period_days', 'Period (days)'),
+    ('min_growth_pct', 'Min trend growth %/90d'),
+    ('max_downside_dev_pct', 'Max downside dev %'),
+    ('max_drawdown_pct', 'Max drawdown %'),
+    ('max_daily_drop_pct', 'Max daily drop %'),
+    ('min_updown_ratio', 'Min up/down ratio'),
+    ('min_coverage_pct', 'Min data coverage %'),
+    ('momentum_days', 'Momentum window (days)'),
+    ('momentum_factor', 'Momentum factor ×'),
+]
+# Upper bound of each steady uptrend input. Dash 4.3's -/+ stepper clamps to
+# `max` but tests `min` for presence, so an input with min and no max turns
+# into NaN (blank) on the first click - every number input needs a max.
+STEADY_TREND_MAX = {
+    'period_days': 1095, 'min_growth_pct': 500, 'max_downside_dev_pct': 100,
+    'max_drawdown_pct': 100, 'max_daily_drop_pct': 100, 'min_updown_ratio': 100,
+    'min_coverage_pct': 100, 'momentum_days': 365, 'momentum_factor': 100,
+}
+
+# Hover help, keyed by the label text shown in the drawer.
+FILTER_HELP = {
+    "% from 30-Day ATH": "Latest close vs. the highest close of the last 30 sessions. "
+                         "0% = at the 30-session high; -20% = 20% below it.",
+    "Days Above SMA10 (30d)": "How many of the last 30 sessions closed above their 10-session simple moving average.",
+    "Days Above EMA10 (30d)": "How many of the last 30 sessions closed above their 10-session exponential moving average.",
+    "Days Above SMA10 (90d)": "How many of the last 90 sessions closed above their 10-session simple moving average.",
+    "Days Above SMA20 (30d)": "How many of the last 30 sessions closed above their 20-session simple moving average.",
+    "Days Above EMA32 (30d)": "How many of the last 30 sessions closed above their 32-session exponential moving average.",
+    "Days Close Above Last High (30d)": "How many of the last 30 sessions closed above the previous session's high.",
+    "Trend (D / W / M)": "Dow-style trend from DiNapoli swing highs/lows on daily, weekly and monthly "
+                         "candles: ↑ wzrostowy (up), ↓ spadkowy (down), → boczny (sideways). "
+                         "'any' = no filter; tickers with unknown trend drop out once a trend is set.",
+    "Min volume × avg20": "Keep tickers whose last session's volume is at least N × their 20-session "
+                          "average volume. Empty = off.",
+    "Price Change Filters": "Keep tickers whose close changed by at least 'Min %' over the lookback "
+                            "(calendar days). Two independent conditions, both must pass. "
+                            "Min % = -100 disables a condition.",
+    "Lookback 1": "Calendar days back for price-change condition 1.",
+    "Min % 1": "Minimum % change of the close over Lookback 1 (-100 = off).",
+    "Lookback 2": "Calendar days back for price-change condition 2.",
+    "Min % 2": "Minimum % change of the close over Lookback 2 (-100 = off).",
+    "ATH Drop Filter": "Excludes tickers that fell too far below their rolling high (over the ATH "
+                       "lookback) during the lookback window.",
+    "ATH lookback": "Sessions used both for the rolling high and for the window that is checked.",
+    "Max overrides": "How many sessions may sit between 'Standard drop %' and 'Override drop %' below "
+                     "the rolling high before the ticker is excluded.",
+    "Standard drop %": "Drop below the rolling high that counts as an override (soft violation).",
+    "Override drop %": "Drop below the rolling high that excludes the ticker immediately (hard violation).",
+    "Steady uptrend": "Screener for stocks rising along a log-linear trend without sharp drops. "
+                      "Shows the results table under the chart and ranks the ticker list by score.",
+    **{label: STEADY_TREND_PARAM_HELP[key] for key, label in STEADY_TREND_INPUTS},
+}
+CONTROL_HELP = {
+    'apply': "Apply filters and redraw the chart (with Live update off, changes wait for this).",
+    'live': "On: every change is applied immediately. Off: changes wait for Apply.",
+    'chart': "Off: the chart and trend badges are not built - filters, ticker selection and the "
+             "steady uptrend table still work. Use it before selecting many tickers.",
+    'select_all': "Select every ticker currently in the list. With many tickers, turn Chart off first "
+                  "to avoid a slow redraw.",
+    'momentum_only': "Only keep tickers with the 🚀 momentum flag.",
+    'table_all': "Show every ticker in the table, including failing ones and the reasons (Fails column).",
+    'open_positions': "Hide tickers you currently hold (open positions from the database).",
+}
+
+
+def _steady_trend_controls():
+    """Drawer block of the steady uptrend screener."""
+    return html.Div(
+        className="filter-item",
+        children=[
+            html.Div(
+                className="toggle-row",
+                children=[
+                    html.Div(
+                        children=[
+                            html.Div("Steady uptrend", className="field-label", title=FILTER_HELP["Steady uptrend"]),
+                            html.Div("Log-trend growth, downside-only risk", className="support-text"),
+                        ]
+                    ),
+                    dcc.Checklist(
+                        id="steady-trend-enable",
+                        options=[{"label": "Enabled", "value": "enabled"}],
+                        value=[],
+                        className="toggle-checklist",
+                    ),
+                ],
+            ),
+            html.Div(
+                className="grid-2",
+                children=[
+                    html.Div(
+                        className="field-surface",
+                        children=[
+                            html.Label(label, className="mini-label", title=FILTER_HELP[label]),
+                            dcc.Input(id=f"steady-{key.replace('_', '-')}", type="number",
+                                      value=STEADY_TREND_PARAMS[key], min=0, max=STEADY_TREND_MAX[key],
+                                      step=NUMBER_STEP, className="m3-input"),
+                        ],
+                    )
+                    for key, label in STEADY_TREND_INPUTS
+                ],
+            ),
+            dcc.Checklist(
+                id="steady-momentum-only",
+                options=[{"label": html.Span("Momentum only", title=CONTROL_HELP['momentum_only']),
+                          "value": "enabled"}],
+                value=[],
+                className="toggle-checklist secondary-toggle",
+            ),
+            dcc.Checklist(
+                id="steady-table-all",
+                options=[{"label": html.Span("Table: all tickers (incl. failing)", title=CONTROL_HELP['table_all']),
+                          "value": "enabled"}],
+                value=[],
+                className="toggle-checklist secondary-toggle",
+            ),
+        ],
+    )
+
+
+TRADINGVIEW_CHART_URL = "https://www.tradingview.com/chart/?symbol="
+
+# Steady uptrend table: base conditional styles (no default pink active/selected
+# cell - a click pins the row instead) and the pinned-row look.
+TABLE_BASE_STYLE = [
+    {'if': {'state': 'active'}, 'backgroundColor': 'transparent', 'border': '1px solid rgb(211, 211, 211)'},
+    {'if': {'state': 'selected'}, 'backgroundColor': 'transparent', 'border': '1px solid rgb(211, 211, 211)'},
+]
+PINNED_ROW_STYLE = {'backgroundColor': 'var(--primary-container)', 'color': 'var(--on-primary-container)',
+                    'fontWeight': 600}
+
+
+def _tradingview_url(ticker, exchanges):
+    """Chart URL with the exchange prefix (NYSE:, NASDAQ:, GPW: ...) from the
+    exchange cache the data pipeline writes; without a known exchange
+    TradingView resolves the bare symbol. Same symbol form as market_metrics
+    (GPW suffix dropped), with US share classes as BRK.B."""
+    prefix = market_mappings.get(exchanges.get(ticker), 'N/A')
+    symbol = ticker.split('.')[0].replace('-', '.')
+    return TRADINGVIEW_CHART_URL + (f"{prefix}:{symbol}" if prefix != 'N/A' else symbol)
+
+
+def _linked_rows(rows, exchanges):
+    """Table records with the ticker as row id and a TradingView markdown link."""
+    for row in rows:
+        ticker = row['Ticker']
+        row['id'] = ticker
+        row['Ticker'] = f"[{ticker}]({_tradingview_url(ticker, exchanges)})"
+    return rows
+
+
+def _file_sig(path):
+    st = Path(path).stat()
+    return (str(path), st.st_mtime_ns, st.st_size)
+
+
+def _source_signature(procedure_choice):
+    """Identifies the inputs of _compute_data(): data files + code. None if the CSV is missing."""
+    csv_file = DATA_FILES.get(procedure_choice)
+    try:
+        sig = [_file_sig(csv_file)]
+        if procedure_choice == "13":
+            sig.append(_file_sig(ETF_DETAILS_FILE))
+    except (OSError, TypeError):
+        return None
+    sig += [_file_sig(f) for f in _CACHE_CODE_FILES if f.exists()]
+    return tuple(sig)
+
+
+def _load_data(procedure_choice):
+    """Everything the Dash layout/callbacks need: CSV-derived data (from the disk
+    cache when the CSV and code are unchanged) plus open positions read fresh from the DB."""
+    sig = _source_signature(procedure_choice)
+    data = None
+    cache_file = Path(f"{DATA_FILES.get(procedure_choice)}.graphcache.pkl")
+    if sig is not None and cache_file.exists():
+        try:
+            cached = pd.read_pickle(cache_file)
+            if cached.get('source_sig') == sig:
+                data = cached['data']
+                print(f"Graph {procedure_choice}: loaded from cache {cache_file}")
+        except Exception as e:
+            print(f"Graph {procedure_choice}: ignoring unreadable cache {cache_file}: {e}")
+    if data is None:
+        data = _compute_data(procedure_choice)
+        if data is None:
+            return None
+        if sig is not None:
+            try:
+                pd.to_pickle({'source_sig': sig, 'data': data}, cache_file)
+            except Exception as e:
+                print(f"Graph {procedure_choice}: could not write cache {cache_file}: {e}")
+
+    return {**data, 'source_sig': sig, 'exchanges': _load_exchange_cache(),
+            'open_positions': payloadPROD_db(), 'loaded_at': datetime.now()}
+
+
+def _compute_data(procedure_choice):
+    """Reads the CSV and computes the derived frames, filter values and dropdown labels."""
+    # --- 1. Data Loading and Preparation ---
+    file_map = DATA_FILES
 
     # Check for valid procedure choice
     if procedure_choice not in file_map:
@@ -119,7 +383,7 @@ def _load_data(procedure_choice):
 
     # --- 1b. Merge ETF details if applicable ---
     if procedure_choice == "13":
-        etf_details_file = 'app/tests/ETF.csv'
+        etf_details_file = ETF_DETAILS_FILE
         try:
             etf_details_df = pd.read_csv(etf_details_file, delimiter=';')
         except FileNotFoundError:
@@ -309,16 +573,23 @@ def _load_data(procedure_choice):
     # Sort ticker_info by pct_diff descending
     ticker_info = sorted(ticker_info, key=lambda x: x['pct_diff'], reverse=True)
 
+    # Date x Ticker close matrix for the dropdown filters (one column lookup per
+    # ticker instead of scanning every close row per ticker).
+    close_wide = (close_prices_df.pivot(index='Date', columns='Ticker', values='Price').sort_index()
+                  if not close_prices_df.empty else pd.DataFrame())
+
     return {
         'df_wide': df,
         'ticker_meta': ticker_meta,
-        'df_melted': df_melted,
-        'close_prices_df': close_prices_df,
+        # The long-format frames are only needed above; keeping them would cost
+        # ~1 GB of RAM (and cache) for the US universe.
+        'min_date': df_melted['Date'].min(),
+        'max_date': df_melted['Date'].max(),
+        'close_wide': close_wide,
+        'close_ffill': close_wide.ffill(),
         'ticker_info': ticker_info,
         'all_themes': all_themes,
         'max_days': max_days,
-        'open_positions': open_positions,
-        'loaded_at': datetime.now(),
     }
 
 
@@ -540,6 +811,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
     if data is None:
         return
     state = dict(data)
+    load_lock = threading.Lock()   # one (re)load at a time, e.g. several tabs opening
 
     # --- 3. Initialize the Dash App ---
     app = dash.Dash(
@@ -589,6 +861,20 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                             html.H1("Ticker filters", className="drawer-title"),
                         ],
                     ),
+                    html.Div(
+                        className="apply-row",
+                        children=[
+                            html.Button("Apply", id="apply-filters-button", className=APPLY_CLASS, n_clicks=0,
+                                        title=CONTROL_HELP['apply']),
+                            dcc.Checklist(
+                                id="live-update-toggle",
+                                options=[{"label": html.Span("Live update", title=CONTROL_HELP['live']),
+                                          "value": "enabled"}],
+                                value=["enabled"],
+                                className="toggle-checklist",
+                            ),
+                        ],
+                    ),
                     # Core Filters Section
                     html.Div(
                         className="drawer-section",
@@ -605,7 +891,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                             html.Div(
                                                 className="filter-row",
                                                 children=[
-                                                    html.Label("% from 30-Day ATH", className="field-label"),
+                                                    html.Label("% from 30-Day ATH", className="field-label", title=FILTER_HELP["% from 30-Day ATH"]),
                                                 ],
                                             ),
                                             dcc.RangeSlider(
@@ -620,7 +906,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                     html.Div(
                                         className="filter-item",
                                         children=[
-                                            html.Label("Days Above SMA10 (30d)", className="field-label"),
+                                            html.Label("Days Above SMA10 (30d)", className="field-label", title=FILTER_HELP["Days Above SMA10 (30d)"]),
                                             dcc.RangeSlider(
                                                 id="sma-filter-slider",
                                                 min=0, max=30, step=1, value=[0, 30],
@@ -632,7 +918,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                     html.Div(
                                         className="filter-item",
                                         children=[
-                                            html.Label("Days Above EMA10 (30d)", className="field-label"),
+                                            html.Label("Days Above EMA10 (30d)", className="field-label", title=FILTER_HELP["Days Above EMA10 (30d)"]),
                                             dcc.RangeSlider(
                                                 id="ema-filter-slider",
                                                 min=0, max=30, step=1, value=[0, 30],
@@ -644,7 +930,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                     html.Div(
                                         className="filter-item",
                                         children=[
-                                            html.Label("Days Above SMA10 (90d)", className="field-label"),
+                                            html.Label("Days Above SMA10 (90d)", className="field-label", title=FILTER_HELP["Days Above SMA10 (90d)"]),
                                             dcc.RangeSlider(
                                                 id="sma90-filter-slider",
                                                 min=0, max=90, step=1, value=[0, 90],
@@ -668,7 +954,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                     html.Div(
                                         className="filter-item",
                                         children=[
-                                            html.Label("Days Above SMA20 (30d)", className="field-label"),
+                                            html.Label("Days Above SMA20 (30d)", className="field-label", title=FILTER_HELP["Days Above SMA20 (30d)"]),
                                             dcc.RangeSlider(
                                                 id="sma20-30-filter-slider",
                                                 min=0, max=30, step=1, value=[0, 30],
@@ -680,7 +966,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                     html.Div(
                                         className="filter-item",
                                         children=[
-                                            html.Label("Days Above EMA32 (30d)", className="field-label"),
+                                            html.Label("Days Above EMA32 (30d)", className="field-label", title=FILTER_HELP["Days Above EMA32 (30d)"]),
                                             dcc.RangeSlider(
                                                 id="ema32-30-filter-slider",
                                                 min=0, max=30, step=1, value=[0, 30],
@@ -692,7 +978,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                     html.Div(
                                         className="filter-item",
                                         children=[
-                                            html.Label("Days Close Above Last High (30d)", className="field-label"),
+                                            html.Label("Days Close Above Last High (30d)", className="field-label", title=FILTER_HELP["Days Close Above Last High (30d)"]),
                                             dcc.RangeSlider(
                                                 id="high30-filter-slider",
                                                 min=0, max=30, step=1, value=[0, 30],
@@ -704,14 +990,14 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                     html.Div(
                                         className="filter-item",
                                         children=[
-                                            html.Div("Trend (D / W / M)", className="field-label block"),
+                                            html.Div("Trend (D / W / M)", className="field-label block", title=FILTER_HELP["Trend (D / W / M)"]),
                                             html.Div(
                                                 className="grid-2",
                                                 children=[
                                                     html.Div(
                                                         className="field-surface",
                                                         children=[
-                                                            html.Label(f"Trend {tf}", className="mini-label"),
+                                                            html.Label(f"Trend {tf}", className="mini-label", title=FILTER_HELP["Trend (D / W / M)"]),
                                                             dcc.Dropdown(id=f"trend-{tf.lower()}-filter",
                                                                          options=TREND_OPTIONS, value="any",
                                                                          clearable=False, className="m3-dropdown"),
@@ -722,9 +1008,9 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                                     html.Div(
                                                         className="field-surface",
                                                         children=[
-                                                            html.Label("Min volume × avg20", className="mini-label"),
+                                                            html.Label("Min volume × avg20", className="mini-label", title=FILTER_HELP["Min volume × avg20"]),
                                                             dcc.Input(id="volume-ratio-input", type="number",
-                                                                      value=None, min=0, step=0.1,
+                                                                      value=None, min=0, max=100, step=NUMBER_STEP,
                                                                       placeholder="off", className="m3-input"),
                                                         ],
                                                     ),
@@ -736,36 +1022,36 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                     html.Div(
                                         className="filter-item",
                                         children=[
-                                            html.Div("Price Change Filters", className="field-label block"),
+                                            html.Div("Price Change Filters", className="field-label block", title=FILTER_HELP["Price Change Filters"]),
                                             html.Div(
                                                 className="grid-2",
                                                 children=[
                                                     html.Div(
                                                         className="field-surface",
                                                         children=[
-                                                            html.Label("Lookback 1", className="mini-label"),
-                                                            dcc.Input(id="price-change-days-input-1", type="number", value=30, min=1, className="m3-input"),
+                                                            html.Label("Lookback 1", className="mini-label", title=FILTER_HELP["Lookback 1"]),
+                                                            dcc.Input(id="price-change-days-input-1", type="number", value=30, min=1, max=3650, step=NUMBER_STEP, className="m3-input"),
                                                         ],
                                                     ),
                                                     html.Div(
                                                         className="field-surface",
                                                         children=[
-                                                            html.Label("Min % 1", className="mini-label"),
-                                                            dcc.Input(id="price-change-pct-input-1", type="number", value=-100, min=-100, className="m3-input"),
+                                                            html.Label("Min % 1", className="mini-label", title=FILTER_HELP["Min % 1"]),
+                                                            dcc.Input(id="price-change-pct-input-1", type="number", value=-100, min=-100, max=100000, step=NUMBER_STEP, className="m3-input"),
                                                         ],
                                                     ),
                                                     html.Div(
                                                         className="field-surface",
                                                         children=[
-                                                            html.Label("Lookback 2", className="mini-label"),
-                                                            dcc.Input(id="price-change-days-input-2", type="number", value=90, min=1, className="m3-input"),
+                                                            html.Label("Lookback 2", className="mini-label", title=FILTER_HELP["Lookback 2"]),
+                                                            dcc.Input(id="price-change-days-input-2", type="number", value=90, min=1, max=3650, step=NUMBER_STEP, className="m3-input"),
                                                         ],
                                                     ),
                                                     html.Div(
                                                         className="field-surface",
                                                         children=[
-                                                            html.Label("Min % 2", className="mini-label"),
-                                                            dcc.Input(id="price-change-pct-input-2", type="number", value=-100, min=-100, className="m3-input"),
+                                                            html.Label("Min % 2", className="mini-label", title=FILTER_HELP["Min % 2"]),
+                                                            dcc.Input(id="price-change-pct-input-2", type="number", value=-100, min=-100, max=100000, step=NUMBER_STEP, className="m3-input"),
                                                         ],
                                                     ),
                                                 ],
@@ -781,7 +1067,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                                 children=[
                                                     html.Div(
                                                         children=[
-                                                            html.Div("ATH Drop Filter", className="field-label"),
+                                                            html.Div("ATH Drop Filter", className="field-label", title=FILTER_HELP["ATH Drop Filter"]),
                                                             html.Div("Dynamic drop logic", className="support-text"),
                                                         ]
                                                     ),
@@ -799,41 +1085,44 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                                     html.Div(
                                                         className="field-surface",
                                                         children=[
-                                                            html.Label("ATH lookback", className="mini-label"),
-                                                            dcc.Input(id="ath-drop-days-slider", type="number", value=90, min=10, className="m3-input"),
+                                                            html.Label("ATH lookback", className="mini-label", title=FILTER_HELP["ATH lookback"]),
+                                                            dcc.Input(id="ath-drop-days-slider", type="number", value=90, min=10, max=1000, step=NUMBER_STEP, className="m3-input"),
                                                         ],
                                                     ),
                                                     html.Div(
                                                         className="field-surface",
                                                         children=[
-                                                            html.Label("Max overrides", className="mini-label"),
-                                                            dcc.Input(id="ath-drop-bypass-count", type="number", value=0, min=0, className="m3-input"),
+                                                            html.Label("Max overrides", className="mini-label", title=FILTER_HELP["Max overrides"]),
+                                                            dcc.Input(id="ath-drop-bypass-count", type="number", value=0, min=0, max=1000, step=NUMBER_STEP, className="m3-input"),
                                                         ],
                                                     ),
                                                     html.Div(
                                                         className="field-surface",
                                                         children=[
-                                                            html.Label("Standard drop %", className="mini-label"),
-                                                            dcc.Input(id="ath-drop-std-pct-slider", type="number", value=6.5, min=0, step=0.5, className="m3-input"),
+                                                            html.Label("Standard drop %", className="mini-label", title=FILTER_HELP["Standard drop %"]),
+                                                            dcc.Input(id="ath-drop-std-pct-slider", type="number", value=6.5, min=0, step=NUMBER_STEP, max=100, className="m3-input"),
                                                         ],
                                                     ),
                                                     html.Div(
                                                         className="field-surface",
                                                         children=[
-                                                            html.Label("Override drop %", className="mini-label"),
-                                                            dcc.Input(id="ath-drop-override-pct-slider", type="number", value=12.0, min=0, step=0.5, className="m3-input"),
+                                                            html.Label("Override drop %", className="mini-label", title=FILTER_HELP["Override drop %"]),
+                                                            dcc.Input(id="ath-drop-override-pct-slider", type="number", value=12.0, min=0, step=NUMBER_STEP, max=100, className="m3-input"),
                                                         ],
                                                     ),
                                                 ],
                                             ),
                                             dcc.Checklist(
                                                 id="open-positions-filter",
-                                                options=[{"label": "Disable open positions", "value": "enabled"}],
+                                                options=[{"label": html.Span("Disable open positions", title=CONTROL_HELP['open_positions']),
+                                          "value": "enabled"}],
                                                 value=[],
                                                 className="toggle-checklist secondary-toggle",
                                             ),
                                         ],
                                     ),
+                                    # Steady Uptrend Filter
+                                    _steady_trend_controls(),
                                 ],
                             ),
                         ],
@@ -855,7 +1144,8 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                         multi=True,
                                         className="m3-dropdown",
                                     ),
-                                    html.Button("Select all filtered", id="select-all-button", className="btn-tonal block-btn"),
+                                    html.Button("Select all filtered", id="select-all-button", className="btn-tonal block-btn",
+                                                title=CONTROL_HELP['select_all']),
                                 ],
                             ),
                         ],
@@ -882,6 +1172,17 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                     html.H2("Dashboard", className="top-title"),
                                     html.Div(
                                         [
+                                            html.Button("Apply", id="apply-top-button", className=APPLY_CLASS, n_clicks=0,
+                                                        title=CONTROL_HELP['apply'],
+                                                        style={'marginRight': '8px'}),
+                                            dcc.Checklist(
+                                                id="chart-enable",
+                                                options=[{"label": html.Span("Chart", title=CONTROL_HELP['chart']),
+                                                          "value": "enabled"}],
+                                                value=[],
+                                                inline=True,
+                                                className="toggle-checklist chart-toggle",
+                                            ),
                                             html.Button("Reload Data", id="reload-data-button", className="btn-tonal", n_clicks=0),
                                             html.Span(
                                                 f"Loaded at {state['loaded_at'].strftime('%Y-%m-%d %H:%M:%S')}",
@@ -937,11 +1238,11 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                                 ),
                                                 dcc.DatePickerRange(
                                                     id="date-picker",
-                                                    min_date_allowed=state['df_melted']['Date'].min().date(),
-                                                    max_date_allowed=state['df_melted']['Date'].max().date(),
-                                                    start_date=(state['df_melted']['Date'].min()
+                                                    min_date_allowed=state['min_date'].date(),
+                                                    max_date_allowed=state['max_date'].date(),
+                                                    start_date=(state['min_date']
                                                                 + pd.Timedelta(days=max(0, state['max_days'] - 30))).date(),
-                                                    end_date=state['df_melted']['Date'].max().date(),
+                                                    end_date=state['max_date'].date(),
                                                     display_format='YYYY-MM-DD',
                                                     first_day_of_week=1,
                                                     minimum_nights=0,
@@ -956,8 +1257,8 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                             value=[max(0, state['max_days'] - 30), state['max_days'] - 1],
                                             step=1,
                                             marks={
-                                                0: (state['df_melted']['Date'].min()).strftime('%Y-%m-%d'),
-                                                state['max_days'] - 1: (state['df_melted']['Date'].max()).strftime('%Y-%m-%d')
+                                                0: (state['min_date']).strftime('%Y-%m-%d'),
+                                                state['max_days'] - 1: (state['max_date']).strftime('%Y-%m-%d')
                                             },
                                             className="compact-range-slider"
                                         ),
@@ -991,6 +1292,44 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
                                             dcc.Graph(id="price-performance-graph", style={'height': '70vh'}, className="graph-frame"),
                                         ],
                                     ),
+                                    html.Div(
+                                        className="panel-card",
+                                        id="steady-trend-panel",
+                                        style={'display': 'none'},
+                                        children=[
+                                            html.Div(
+                                                className="panel-head",
+                                                children=[
+                                                    html.Div(children=[html.H3("Steady uptrend", className="panel-title"),
+                                                                       html.P("Tickers passing all filters, best score first. "
+                                                                              "Downside dev / max below trend: log residuals under the "
+                                                                              "regression line; R² is informational only.",
+                                                                              className="panel-copy")]),
+                                                    html.Div(id="steady-trend-count", className="state-chip"),
+                                                ],
+                                            ),
+                                            dash_table.DataTable(
+                                                id="steady-trend-table",
+                                                columns=[{'name': c, 'id': c,
+                                                          **({'presentation': 'markdown'} if c == 'Ticker' else {})}
+                                                         for c in STEADY_TREND_COLUMNS],
+                                                data=[],
+                                                markdown_options={'link_target': '_blank'},
+                                                style_data_conditional=TABLE_BASE_STYLE,
+                                                tooltip_header=STEADY_TREND_COLUMN_HELP,
+                                                tooltip_delay=0,
+                                                tooltip_duration=None,
+                                                sort_action="native",
+                                                filter_action="native",
+                                                page_action="native",
+                                                page_size=25,
+                                                style_table={'overflowX': 'auto'},
+                                                style_cell={'padding': '6px 10px', 'textAlign': 'right'},
+                                                style_cell_conditional=[{'if': {'column_id': 'Ticker'}, 'textAlign': 'left'}],
+                                                style_header={'fontWeight': 'bold'},
+                                            ),
+                                        ],
+                                    ),
                                 ],
                             ),
                         ],
@@ -999,6 +1338,8 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
             ),
             # Store hidden tickers
             dcc.Store(id='hidden-traces-store', data=[]),
+            dcc.Store(id='filter-applied', data=None),
+            dcc.Store(id='steady-pinned', data=[]),   # tickers whose table row is pinned
         ],
     )
 
@@ -1045,49 +1386,47 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
         open_style = {'display': 'none'} if visible else {'display': 'inline-block', 'marginBottom': '8px'}
         return shell_style, drawer_style, {'visible': visible}, open_style
 
-    @app.callback(
-        Output('ticker-dropdown', 'options'),
-        [
-            Input('ath-filter-slider', 'value'),
-            Input('sma-filter-slider', 'value'),
-            Input('ema-filter-slider', 'value'),
-            Input('sma90-filter-slider', 'value'),
-            Input('sma20-30-filter-slider', 'value'),
-            Input('ema32-30-filter-slider', 'value'),
-            Input('high30-filter-slider', 'value'),
-            Input('theme-filter-dropdown', 'value'),
-            Input('open-positions-filter', 'value'),
-            Input('ath-drop-enable', 'value'),
-            Input('ath-drop-days-slider', 'value'),
-            Input('ath-drop-std-pct-slider', 'value'),
-            Input('ath-drop-override-pct-slider', 'value'),
-            Input('ath-drop-bypass-count', 'value'),
-            Input('price-change-days-input-1', 'value'),
-            Input('price-change-pct-input-1', 'value'),
-            Input('price-change-days-input-2', 'value'),
-            Input('price-change-pct-input-2', 'value'),
-            Input('trend-d-filter', 'value'),
-            Input('trend-w-filter', 'value'),
-            Input('trend-m-filter', 'value'),
-            Input('volume-ratio-input', 'value'),
-            # Re-run after a data reload so options reflect the fresh state.
-            Input('reload-status', 'children'),
-        ]
-    )
-    def update_dropdown_options(ath_slider_range, sma30_slider_range, ema30_slider_range, sma90_slider_range,
+    steady_input_ids = [f"steady-{key.replace('_', '-')}" for key, _ in STEADY_TREND_INPUTS]
+    # Value inputs that wait for Apply while Live update is off.
+    filter_input_ids = ['ath-filter-slider', 'sma-filter-slider', 'ema-filter-slider', 'sma90-filter-slider',
+                        'sma20-30-filter-slider', 'ema32-30-filter-slider', 'high30-filter-slider',
+                        'theme-filter-dropdown', 'open-positions-filter', 'ath-drop-enable',
+                        'ath-drop-days-slider', 'ath-drop-std-pct-slider', 'ath-drop-override-pct-slider',
+                        'ath-drop-bypass-count', 'price-change-days-input-1', 'price-change-pct-input-1',
+                        'price-change-days-input-2', 'price-change-pct-input-2', 'trend-d-filter',
+                        'trend-w-filter', 'trend-m-filter', 'volume-ratio-input',
+                        'steady-trend-enable', 'steady-momentum-only', 'steady-table-all']
+    view_input_ids = ['ticker-dropdown', 'metric-checklist', 'days-slider', 'indicator-checklist',
+                      'interval-radio']
+    steady_metrics_cache = {}   # (loaded_at, period, momentum days) -> unfiltered metrics
+
+    def _steady_metrics(period_days, momentum_days):
+        key = (state['loaded_at'], period_days, momentum_days)
+        if key not in steady_metrics_cache:
+            steady_metrics_cache.clear()
+            steady_metrics_cache[key] = steady_trend_metrics(state['close_wide'], period_days, momentum_days)
+        return steady_metrics_cache[key]
+
+    def _filter_tickers(ath_slider_range, sma30_slider_range, ema30_slider_range, sma90_slider_range,
                                 sma20_30_slider_range, ema32_30_slider_range, high30_slider_range, selected_themes,
                                 open_positions_filter, ath_drop_enabled, ath_drop_days, ath_drop_std_pct,
                                 ath_drop_override_pct, ath_drop_bypass_count,
                                 pc1_days, pc1_min_pct, pc2_days, pc2_min_pct,
-                                trend_d, trend_w, trend_m, min_vol_ratio, _reload_status):
+                                trend_d, trend_w, trend_m, min_vol_ratio, _reload_status,
+                                steady_enabled, steady_momentum_only, steady_table_all, *rest):
         """
         Filters the ticker dropdown options based on various filter sliders.
         """
         ticker_info = state['ticker_info']
-        close_prices_df = state['close_prices_df']
+        close_wide = state['close_wide']
+        close_ffill = state['close_ffill']
         open_positions = state['open_positions']
+        steady_values, live_update = rest[:len(steady_input_ids)], rest[-1]
+        if _apply_blocked(live_update):
+            raise PreventUpdate
+        steady_off = ([], {'display': 'none'}, "")
         if not ticker_info:
-            return []
+            return ([],) + steady_off
 
         ath_min, ath_max = ath_slider_range
         sma30_min, sma30_max = sma30_slider_range
@@ -1134,31 +1473,23 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
             if days is None or min_pct is None:
                 return current_filtered
             
-            # Determine reference dates
-            end_date = close_prices_df['Date'].max()
-            start_date = end_date - pd.to_timedelta(days, unit='D')
-            
-            # Filter close_prices_df for current candidate tickers
-            candidate_tickers_set = set(t['value'] for t in current_filtered)
-            if not candidate_tickers_set:
+            if not current_filtered or close_ffill.empty:
                 return []
-                
-            relevant_df = close_prices_df[close_prices_df['Ticker'].isin(candidate_tickers_set)]
-            
-            # Get latest prices (last available for each ticker)
-            curr_prices = relevant_df.sort_values('Date').groupby('Ticker')['Price'].last()
-            
-            # Get past prices (last available on or before start_date)
-            past_prices_df = relevant_df[relevant_df['Date'] <= start_date]
-            past_prices = past_prices_df.sort_values('Date').groupby('Ticker')['Price'].last()
-            
-            # Calculate % change
-            common_tickers = curr_prices.index.intersection(past_prices.index)
-            pct_changes = (curr_prices.loc[common_tickers] - past_prices.loc[common_tickers]) / past_prices.loc[common_tickers] * 100
-            
-            # Filter
-            valid_tickers = pct_changes[pct_changes >= min_pct].index
-            valid_tickers_set = set(valid_tickers)
+
+            # Reference dates
+            end_date = close_ffill.index.max()
+            start_date = end_date - pd.to_timedelta(days, unit='D')
+
+            # Latest price and last price on or before start_date (forward-filled
+            # matrix: the last row holds each ticker's last available close).
+            curr_prices = close_ffill.iloc[-1]
+            past_rows = close_ffill.loc[:start_date]
+            if past_rows.empty:
+                return []
+            past_prices = past_rows.iloc[-1]
+
+            pct_changes = ((curr_prices - past_prices) / past_prices * 100).dropna()
+            valid_tickers_set = set(pct_changes[pct_changes >= min_pct].index)
             return [t for t in current_filtered if t['value'] in valid_tickers_set]
 
         # Apply Price Change Filter 1
@@ -1173,14 +1504,16 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
 
             for ticker_data in filtered_tickers:
                 ticker_val = ticker_data['value']
-                ticker_df = close_prices_df[close_prices_df['Ticker'] == ticker_val]
+                if ticker_val not in close_wide.columns:
+                    continue
+                prices = close_wide[ticker_val].dropna()
 
-                if len(ticker_df) < ath_drop_days:
+                if len(prices) < ath_drop_days:
                     continue
 
                 # Calculate rolling ATH and pct drop
-                rolling_ath = ticker_df['Price'].rolling(window=ath_drop_days, min_periods=1).max()
-                pct_drop = (rolling_ath - ticker_df['Price']) / rolling_ath.replace(0, 1)
+                rolling_ath = prices.rolling(window=ath_drop_days, min_periods=1).max()
+                pct_drop = (rolling_ath - prices) / rolling_ath.replace(0, 1)
                 
                 recent_drops = pct_drop.tail(ath_drop_days)
 
@@ -1197,7 +1530,90 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
             
             filtered_tickers = tickers_to_keep
 
-        return [{'label': t['label'], 'value': t['value']} for t in filtered_tickers]
+        # Apply steady uptrend filter: best score first, score (and 🚀 momentum) in the label.
+        if 'enabled' in (steady_enabled or []):
+            params = {key: v for (key, _), v in zip(STEADY_TREND_INPUTS, steady_values)}
+            period = int(params['period_days'] or STEADY_TREND_PARAMS['period_days'])
+            mom_days = int(params['momentum_days'] or STEADY_TREND_PARAMS['momentum_days'])
+            by_ticker = {t['value']: t for t in filtered_tickers}
+            scored = score_steady_trend(_steady_metrics(period, mom_days), params)
+            scored = scored[scored.index.isin(list(by_ticker))]
+            passing = scored[scored['passes']]
+            if 'enabled' in (steady_momentum_only or []):
+                passing = passing[passing['momentum']]
+            options = [{'label': f"{'🚀 ' if r['momentum'] else ''}[S {r['score']:.0f}] {by_ticker[tk]['label']}",
+                        'value': tk}
+                       for tk, r in passing.iterrows()]
+            table = scored if 'enabled' in (steady_table_all or []) else passing
+            count = f"{len(options)} pass" + (f" of {len(table)}" if table is scored else "") + f" · {period}d"
+            rows = _linked_rows(steady_trend_rows(table), state.get('exchanges', {}))
+            return options, rows, {'display': 'block'}, count
+
+        return ([{'label': t['label'], 'value': t['value']} for t in filtered_tickers],) + steady_off
+
+    @app.callback(
+        [Output('ticker-dropdown', 'options'),
+         Output('steady-trend-table', 'data'),
+         Output('steady-trend-panel', 'style'),
+         Output('steady-trend-count', 'children'),
+         Output('ticker-dropdown', 'value', allow_duplicate=True),
+         Output('filter-applied', 'data')],
+        [
+            Input('ath-filter-slider', 'value'),
+            Input('sma-filter-slider', 'value'),
+            Input('ema-filter-slider', 'value'),
+            Input('sma90-filter-slider', 'value'),
+            Input('sma20-30-filter-slider', 'value'),
+            Input('ema32-30-filter-slider', 'value'),
+            Input('high30-filter-slider', 'value'),
+            Input('theme-filter-dropdown', 'value'),
+            Input('open-positions-filter', 'value'),
+            Input('ath-drop-enable', 'value'),
+            Input('ath-drop-days-slider', 'value'),
+            Input('ath-drop-std-pct-slider', 'value'),
+            Input('ath-drop-override-pct-slider', 'value'),
+            Input('ath-drop-bypass-count', 'value'),
+            Input('price-change-days-input-1', 'value'),
+            Input('price-change-pct-input-1', 'value'),
+            Input('price-change-days-input-2', 'value'),
+            Input('price-change-pct-input-2', 'value'),
+            Input('trend-d-filter', 'value'),
+            Input('trend-w-filter', 'value'),
+            Input('trend-m-filter', 'value'),
+            Input('volume-ratio-input', 'value'),
+            # Re-run after a data reload so options reflect the fresh state.
+            Input('reload-status', 'children'),
+            Input('steady-trend-enable', 'value'),
+            Input('steady-momentum-only', 'value'),
+            Input('steady-table-all', 'value'),
+        ] + [Input(i, 'value') for i in steady_input_ids]
+        + [Input(b, 'n_clicks') for b in APPLY_BUTTONS] + [Input('live-update-toggle', 'value')],
+        [State('ticker-dropdown', 'value')],
+        prevent_initial_call='initial_duplicate',
+    )
+    def update_dropdown_options(*args):
+        """Filters the ticker list; also trims the selection to it and stamps
+        'filter-applied', so the chart redraws once, from the trimmed selection."""
+        *filter_args, current_selection = args
+        result = _filter_tickers(*filter_args)
+        if not dash.callback_context.triggered:   # initial call: layout already matches
+            return (*result, dash.no_update, dash.no_update)
+        valid = {o['value'] for o in result[0]}
+        selection = [v for v in (current_selection or []) if v in valid]
+        return (*result, selection, datetime.now().isoformat())
+
+    @app.callback(
+        [Output(b, 'className') for b in APPLY_BUTTONS],
+        [Input(i, 'value') for i in filter_input_ids + steady_input_ids + view_input_ids]
+        + [Input(b, 'n_clicks') for b in APPLY_BUTTONS]
+        + [Input('live-update-toggle', 'value'), Input('reload-status', 'children'),
+           Input('filter-applied', 'data')],
+        prevent_initial_call=True,
+    )
+    def mark_apply_pending(*args):
+        """Highlights the Apply buttons while changes wait to be applied."""
+        pending = _apply_blocked(args[-3])
+        return [APPLY_CLASS + (" pending" if pending else "")] * len(APPLY_BUTTONS)
 
     @app.callback(
         Output('ticker-dropdown', 'value'),
@@ -1222,15 +1638,35 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
             Input('days-slider', 'value'),
             Input('indicator-checklist', 'value'),
             Input('interval-radio', 'value'),
+            Input('chart-enable', 'value'),
+            # Apply / Reload / Live toggle reach the chart through the filter
+            # callback, which stamps this after trimming the selection.
+            Input('filter-applied', 'data'),
         ],
-        [State('hidden-traces-store', 'data')]
+        [State('live-update-toggle', 'value'),
+         State('hidden-traces-store', 'data')]
     )
     def update_graph(selected_tickers, selected_metrics, date_range, selected_indicators,
-                     interval, hidden_tickers):
+                     interval, chart_enabled, _filter_applied, live_update, *rest):
         """
         Updates the main performance graph based on user selections and returns the count of days.
         Daily or weekly candles (interval), indicators computed at that interval.
+        With Live update off, only redraws on Apply / data reload; with the Chart
+        switch off, never builds the chart.
         """
+        hidden_tickers = rest[-1]
+        if _apply_blocked(live_update):
+            raise PreventUpdate
+        if 'enabled' not in (chart_enabled or []):
+            fig = go.Figure()
+            fig.update_layout(
+                xaxis={'visible': False}, yaxis={'visible': False}, template='plotly_white',
+                annotations=[{'text': f"Chart is off - {len(selected_tickers or [])} ticker(s) selected. "
+                                      "Turn on 'Chart' in the top bar to draw them.",
+                              'xref': 'paper', 'yref': 'paper', 'showarrow': False,
+                              'font': {'size': 18, 'color': '#888'}}],
+            )
+            return fig, ""
         if not selected_tickers or not selected_metrics or not date_range:
             fig = go.Figure()
             fig.update_layout(
@@ -1241,8 +1677,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
             )
             return fig, "No days selected"
 
-        df_melted = state['df_melted']
-        min_date = df_melted['Date'].min()
+        min_date = state['min_date']
         start_idx, end_idx = date_range
         start_date = min_date + pd.to_timedelta(start_idx, unit='D')
         end_date = min_date + pd.to_timedelta(end_idx, unit='D')
@@ -1339,12 +1774,45 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
         return fig, count_text
 
     @app.callback(
+        Output('steady-trend-table', 'style_data_conditional'),
+        Output('steady-pinned', 'data'),
+        Output('steady-trend-table', 'active_cell'),
+        Input('steady-trend-table', 'active_cell'),
+        Input('steady-trend-table', 'data'),
+        State('steady-pinned', 'data'),
+        prevent_initial_call=True,
+    )
+    def toggle_pinned_rows(active_cell, data, pinned):
+        """A click on a row pins its highlight, a second click unpins it (clicks on
+        the Ticker link only open TradingView). Pins are kept by ticker, so they
+        survive sorting, filtering, paging and new table data."""
+        pinned = list(pinned or [])
+        clicked = 'steady-trend-table.active_cell' in dash.callback_context.triggered_prop_ids
+        if clicked and active_cell and active_cell.get('column_id') != 'Ticker':
+            ticker = active_cell.get('row_id')
+            if ticker in pinned:
+                pinned.remove(ticker)
+            elif ticker is not None:
+                pinned.append(ticker)
+        # Matched on the row id (= ticker), not row_index: row_index follows the
+        # displayed order, so a pin would jump to another row after sorting.
+        present = {row.get('id') for row in (data or [])}
+        styles = TABLE_BASE_STYLE + [{'if': {'filter_query': f'{{id}} = "{t}"'}, **PINNED_ROW_STYLE}
+                                     for t in pinned if t in present]
+        # Clear the active cell so a second click on the same cell fires again.
+        return styles, pinned, None
+
+    @app.callback(
         Output('trend-badges', 'children'),
         [Input('ticker-dropdown', 'value'),
-         Input('reload-status', 'children')],
+         Input('reload-status', 'children'),
+         Input('chart-enable', 'value')],
     )
-    def update_trend_badges(selected_tickers, _reload_status):
-        """D/W/M trend chips for every selected ticker (from _load_data's trend_summary)."""
+    def update_trend_badges(selected_tickers, _reload_status, chart_enabled):
+        """D/W/M trend chips for every selected ticker (from _load_data's trend_summary);
+        none while the Chart switch is off."""
+        if 'enabled' not in (chart_enabled or []):
+            return []
         info = {t['value']: t for t in state['ticker_info']}
         return [trend_badge(t, info.get(t, {}).get('trend')) for t in (selected_tickers or [])]
 
@@ -1401,18 +1869,23 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
         prevent_initial_call=True
     )
     def reload_data(n_clicks, n_intervals, current_selection):
-        """Re-reads the CSV/DB from disk and refreshes the in-memory dataset used by all other callbacks."""
-        new_data = _load_data(procedure_choice)
-        if new_data is None:
-            return (dash.no_update,) * 9 + (
-                f"Reload failed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - check server logs",
-            )
-
-        state.clear()
-        state.update(new_data)
+        """Refreshes the in-memory dataset used by all other callbacks. On page open
+        the CSV-derived data is reused unless the CSV (or code) changed; the Reload
+        button always goes through _load_data (disk cache if still valid)."""
+        with load_lock:
+            page_open = dash.callback_context.triggered_id == 'initial-load-trigger'
+            if page_open and state.get('source_sig') == _source_signature(procedure_choice):
+                state['open_positions'] = payloadPROD_db()
+            else:
+                new_data = _load_data(procedure_choice)
+                if new_data is None:
+                    return (dash.no_update,) * 9 + (
+                        f"Reload failed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - check server logs",
+                    )
+                state.clear()
+                state.update(new_data)
 
         ticker_info = state['ticker_info']
-        df_melted = state['df_melted']
         max_days = state['max_days']
 
         options = [{'label': t['label'], 'value': t['value']} for t in ticker_info]
@@ -1424,14 +1897,14 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
         theme_options = [{'label': theme, 'value': theme} for theme in state['all_themes']]
 
         marks = {
-            0: df_melted['Date'].min().strftime('%Y-%m-%d'),
-            max_days - 1: df_melted['Date'].max().strftime('%Y-%m-%d'),
+            0: state['min_date'].strftime('%Y-%m-%d'),
+            max_days - 1: state['max_date'].strftime('%Y-%m-%d'),
         }
         slider_value = [max(0, max_days - 30), max_days - 1]
         status = f"Loaded at {state['loaded_at'].strftime('%Y-%m-%d %H:%M:%S')}"
 
         return (options, new_selection, theme_options, 0, max_days - 1, slider_value, marks,
-                df_melted['Date'].min().date(), df_melted['Date'].max().date(), status)
+                state['min_date'].date(), state['max_date'].date(), status)
 
     preset_ids = [f"range-{n}" for n in RANGE_PRESETS]
 
@@ -1453,7 +1926,7 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
         a single callback). Slider values are day offsets from the first
         loaded date; a preset means 'the last N days up to the newest date'."""
         start_date, end_date, slider_value = args[len(preset_ids):]
-        min_date = state['df_melted']['Date'].min()
+        min_date = state['min_date']
         max_idx = state['max_days'] - 1
         triggered = dash.callback_context.triggered[0]['prop_id'].split('.')[0] \
             if dash.callback_context.triggered else ''
@@ -1471,7 +1944,10 @@ def graph_start(procedure_choice, def_filter_graph_list, server=None):
 
         classes = ["range-btn active" if value == [max(0, max_idx - n + 1), max_idx] else "range-btn"
                    for n in RANGE_PRESETS]
-        return ([value,
+        # Writing the unchanged value back would re-trigger the chart and mark
+        # Apply as pending.
+        slider_out = dash.no_update if value == slider_value else value
+        return ([slider_out,
                  (min_date + pd.Timedelta(days=value[0])).date(),
                  (min_date + pd.Timedelta(days=value[1])).date()]
                 + classes)

@@ -185,6 +185,49 @@ button, input { font: inherit; }
   background: var(--surface-high);
   color: var(--text);
 }
+/* Apply filters: drawer row + top bar; "pending" while changes wait (Live update off). */
+.apply-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 12px 0 4px;
+}
+.apply-btn.pending {
+  background: var(--primary);
+  color: var(--on-primary);
+  box-shadow: var(--shadow-1);
+}
+/* Chart on/off switch next to the top-bar Apply button. */
+.chart-toggle {
+  display: inline-block;
+  margin-right: 8px;
+  vertical-align: middle;
+}
+/* A number the browser rejects (off the step grid / out of range) reaches the
+   callbacks as None, so make it visible instead of silently ignored. */
+.m3-input input:invalid,
+input.m3-input:invalid {
+  outline: 2px solid #dc2626;
+  outline-offset: -2px;
+}
+/* Steady uptrend table: hover tint drawn over any background (also over a
+   pinned row's), pointer for the click-to-pin rows, compact markdown links. */
+#steady-trend-table td.dash-cell { cursor: pointer; }
+#steady-trend-table tr:hover td.dash-cell {
+  box-shadow: inset 0 0 0 9999px rgba(11, 87, 208, 0.08);
+}
+#steady-trend-table .dash-cell .dash-cell-value p { margin: 0; }
+#steady-trend-table .dash-cell a { color: var(--primary); font-weight: 600; text-decoration: none; }
+#steady-trend-table .dash-cell a:hover { text-decoration: underline; }
+/* Labels/controls with hover help (title attribute). */
+.field-label[title],
+.mini-label[title],
+.toggle-checklist span[title] {
+  cursor: help;
+  text-decoration: underline dotted;
+  text-decoration-color: var(--outline-variant);
+  text-underline-offset: 3px;
+}
 .main-content {
   min-width: 0;
   display: grid;

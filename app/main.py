@@ -1,8 +1,8 @@
 import sys
 from services.google_gsheet import init_client, gsheet_update, gsheet_update_db, gsheet_update_db_roi
-from tickers_lists.ticker_groups import payload, payloadPROD, default_filter_graph, us_market_list_def, payload_push, payloadPROD_db
+from tickers_lists.ticker_groups import payload, payloadPROD, default_filter_graph, us_market_list_def, payload_push, payloadPROD_db, us_other_list_def, US_MIN_DOLLAR_VOLUME
 from tickers_lists.etf_list import etf_list
-from services.market_metrics import metrics_separate_tabs
+from services.market_metrics import metrics_separate_tabs, seed_exchange_cache
 from services.market_config  import market_mappings 
 from output.graph import graph_start
 from output.trade_txn_editor import trade_txn_editor_start
@@ -27,6 +27,14 @@ def run_procedure(procedure_choice):
         ]
         metrics1 = metrics_separate_tabs(tickers, procedure_choice, market_mappings)
         gsheet_update(metrics1, creds, procedure_choice)
+    elif procedure_choice == "3":
+        creds = init_client()
+        us_df = us_other_list_def()
+        seed_exchange_cache(dict(zip(us_df['Sym'], us_df['Exchange'])))
+        tickers = us_df['Sym'].tolist()
+        metrics1 = metrics_separate_tabs(tickers, procedure_choice, market_mappings,
+                                         min_dollar_volume=US_MIN_DOLLAR_VOLUME)
+        gsheet_update(metrics1, creds, procedure_choice)
     elif procedure_choice == "4":
         run_exchange_rate_update()
         creds = init_client()
@@ -48,6 +56,9 @@ def run_procedure(procedure_choice):
         graph = graph_start(procedure_choice, def_filter_graph_list)
     elif procedure_choice == "7":
         def_filter_graph_list = default_filter_graph(None)            
+        graph = graph_start(procedure_choice, def_filter_graph_list)
+    elif procedure_choice == "10":
+        def_filter_graph_list = default_filter_graph(None)
         graph = graph_start(procedure_choice, def_filter_graph_list)
     elif procedure_choice == "8":
         print("pass")
@@ -86,11 +97,13 @@ def main():
         print("Which market would you like to trigger?")
         print("1. GPW")
         print("2. S&P500")
+        print("3. US (NYSE + NASDAQ, ex S&P500)")
         print("4. fast PROD")
         print("5. graph GPW")
         print("6. graph S&P 500")
         print("7. graph PROD")
         print("9. push notification test")
+        print("10. graph US")
         print("12. ETF")
         print("13. graph ETF")
         print("14. exchange rates")

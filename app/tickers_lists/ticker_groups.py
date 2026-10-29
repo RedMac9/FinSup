@@ -130,6 +130,75 @@ def us_market_list_def():
     return df
 
 
+# --- US (NYSE + NASDAQ) stocks outside the S&P 500 -------------------------
+# Universe filter, step 1 (before download): market cap from the Nasdaq screener.
+# Step 2 (after download) is the median 50-day dollar-volume floor, applied in
+# market_metrics.filter_by_dollar_volume().
+US_MIN_MARKET_CAP = 2e9          # USD; mid-cap and up
+US_MIN_DOLLAR_VOLUME = 10e6      # USD/day, median of Close*Volume over 50 sessions
+US_INCLUDE_FOREIGN = True        # False = keep only country == 'United States' (drops ADRs etc.)
+US_EXCHANGES = {'nyse': 'NYQ', 'nasdaq': 'NMS'}   # screener exchange -> yfinance exchange code
+
+NASDAQ_SCREENER_URL = 'https://api.nasdaq.com/api/screener/stocks'
+# Debt and preferred lines inherit the issuer's market cap in the screener.
+US_JUNK_NAME_RE = r'\b(?:Notes?|Debentures?|Warrants?|Perpetual|Subordinated|Cumulative|Fixed-Rate|Fixed-to-Floating)\b'
+US_ADR_NAME_RE = r'American Depositary|\bADRs?\b|\bADSs?\b'
+
+
+def _to_yf_symbol(symbol):
+    """BRK/B, BRK.B -> BRK-B (yfinance form)."""
+    return str(symbol).strip().replace('/', '-').replace('.', '-')
+
+
+def us_other_list_def():
+    """NYSE + NASDAQ common stocks with market cap >= US_MIN_MARKET_CAP that are
+    not in the S&P 500. Returns DataFrame [Sym, Security, Exchange, MarketCap, Country]
+    where Sym is in yfinance form and Exchange is a yfinance exchange code."""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                      '(KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+    }
+    frames = []
+    for exchange, yf_code in US_EXCHANGES.items():
+        resp = requests.get(NASDAQ_SCREENER_URL, headers=headers, timeout=30,
+                            params={'tableonly': 'true', 'download': 'true', 'exchange': exchange})
+        resp.raise_for_status()
+        rows = (resp.json().get('data') or {}).get('rows') or []
+        if not rows:
+            raise RuntimeError(f"Nasdaq screener returned no rows for exchange '{exchange}'.")
+        part = pd.DataFrame(rows)
+        part['Exchange'] = yf_code
+        frames.append(part)
+    df = pd.concat(frames, ignore_index=True)
+    total = len(df)
+
+    df['MarketCap'] = pd.to_numeric(df['marketCap'], errors='coerce')
+    df = df[df['MarketCap'] >= US_MIN_MARKET_CAP]
+    df = df[~df['symbol'].str.contains(r'\^', regex=True)]            # preferred series (ABR^D)
+    name = df['name'].fillna('')
+    is_adr = name.str.contains(US_ADR_NAME_RE, case=False, regex=True)
+    junk = name.str.contains(US_JUNK_NAME_RE, case=False, regex=True) \
+        | (~is_adr & name.str.contains('Preferred', case=False))
+    df = df[~junk]
+    if not US_INCLUDE_FOREIGN:
+        df = df[df['country'] == 'United States']
+
+    sp500 = {_to_yf_symbol(s) for s in us_market_list_def()['Sym']}
+    df['Sym'] = df['symbol'].map(_to_yf_symbol)
+    # Other share classes of S&P 500 members count as S&P 500 too (BRK-A vs BRK-B).
+    sp500_base = {s.split('-')[0] for s in sp500}
+    in_sp500 = df['Sym'].isin(sp500) | (df['Sym'].str.contains('-') & df['Sym'].str.split('-').str[0].isin(sp500_base))
+    df = df[~in_sp500].drop_duplicates('Sym')
+
+    out = df.rename(columns={'name': 'Security', 'country': 'Country'})[
+        ['Sym', 'Security', 'Exchange', 'MarketCap', 'Country']
+    ].sort_values('MarketCap', ascending=False).reset_index(drop=True)
+    print(f"US universe: {total} listed, {len(out)} kept "
+          f"(market cap >= {US_MIN_MARKET_CAP / 1e9:.1f}B, {int(in_sp500.sum())} S&P 500 names removed).")
+    return out
+
+
 def payloadPROD(creds):
     try:
         service = build('sheets', 'v4', credentials=creds)

@@ -177,7 +177,7 @@ log_capture = LogCapture()
 
 # Initialize Dash apps attached to the Flask server
 # These need to be initialized at startup
-graph_choices = ["5", "6", "7", "13"]
+graph_choices = ["5", "6", "10", "7", "13"]
 for choice in graph_choices:
     # Use a dummy list for initialization, can be adjusted if needed
     graph_start(choice, default_filter_graph(None), server=app)
@@ -190,6 +190,7 @@ def index():
     procedures = [
         {"id": "1", "name": "GPW Update", "description": "Update GPW market metrics and Google Sheets."},
         {"id": "2", "name": "S&P500 Update", "description": "Update S&P500 market metrics and Google Sheets."},
+        {"id": "3", "name": "US Update", "description": "Update US (NYSE + NASDAQ, ex S&P500) metrics and Google Sheets."},
         {"id": "4", "name": "Fast PROD", "description": "Run full production update (Exchange rates, DB, GSheet, Push)."},
         {"id": "9", "name": "Push Notification Test", "description": "Send a test notification via Pushbullet."},
         {"id": "12", "name": "ETF Update", "description": "Update ETF metrics and Google Sheets."},
@@ -199,6 +200,7 @@ def index():
     dash_tools = [
         {"id": "5", "name": "Graph GPW", "url": "/graph/5/"},
         {"id": "6", "name": "Graph S&P 500", "url": "/graph/6/"},
+        {"id": "10", "name": "Graph US", "url": "/graph/10/"},
         {"id": "7", "name": "Graph PROD", "url": "/graph/7/"},
         {"id": "13", "name": "Graph ETF", "url": "/graph/13/"},
         {"id": "15", "name": "Trade Txn Editor", "url": "/trade_txn_editor/"},
@@ -207,7 +209,7 @@ def index():
     
     return render_template('index.html', procedures=procedures, dash_tools=dash_tools)
 
-ALLOWED_PROCEDURES = {"1", "2", "4", "9", "12", "14"}
+ALLOWED_PROCEDURES = {"1", "2", "3", "4", "9", "12", "14"}
 
 @app.route('/run/<procedure_id>', methods=['POST'])
 def run_proc(procedure_id):

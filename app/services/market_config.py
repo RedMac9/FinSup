@@ -3,6 +3,7 @@ market_mappings = {
     'WSE': 'GPW',
     'NMS': 'NASDAQ',
     'NCM': 'NASDAQ',
+    'NGM': 'NASDAQ',
     'GER': 'MIL',
     'LSE': 'LSE',    
     'ErrorFetchingInfo': 'N/A'

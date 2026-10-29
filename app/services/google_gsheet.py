@@ -90,6 +90,8 @@ def gsheet_update(metrics1, creds, procedure_choice):
             sheet_name = "IN_GPW"
         elif procedure_choice == "2":
             sheet_name = "IN_S&P500"
+        elif procedure_choice == "3":
+            sheet_name = "IN_US"
         elif procedure_choice == "4":
             sheet_name = "IN_PROD2"
         else:

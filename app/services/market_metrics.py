@@ -50,6 +50,36 @@ def get_market_info(tickers, max_workers=20):
 
     return market_info_dict
 
+
+def seed_exchange_cache(exchange_by_ticker):
+    """Add known exchange codes to the cache (existing entries win), so large
+    universes whose exchange is already known skip the slow per-ticker .info call."""
+    cache = _load_exchange_cache()
+    added = {t: ex for t, ex in exchange_by_ticker.items() if t not in cache}
+    if added:
+        cache.update(added)
+        _save_exchange_cache(cache)
+    return len(added)
+
+
+# Dollar-volume liquidity filter (Close * Volume, unadjusted Close).
+DOLLAR_VOLUME_DAYS = 50        # look-back window in sessions
+DOLLAR_VOLUME_MIN_DAYS = 40    # fewer valid sessions (recent IPO, gaps) -> excluded
+
+
+def median_dollar_volume(tickers_data, tickers, days=DOLLAR_VOLUME_DAYS, min_days=DOLLAR_VOLUME_MIN_DAYS):
+    """Median daily dollar volume over the last `days` sessions per ticker (NaN if
+    fewer than `min_days` valid sessions). Median, so one earnings or index-rebalance
+    spike can't lift a thin name over the threshold."""
+    out = {}
+    for ticker in tickers:
+        if (ticker, 'Close') not in tickers_data.columns or (ticker, 'Volume') not in tickers_data.columns:
+            out[ticker] = np.nan
+            continue
+        dv = (tickers_data[(ticker, 'Close')] * tickers_data[(ticker, 'Volume')]).dropna().tail(days)
+        out[ticker] = dv.median() if len(dv) >= min_days else np.nan
+    return pd.Series(out, dtype=float)
+
 # How much daily history the chart CSVs (historical_prices_*.csv) hold. The
 # DiNapoli engine needs years, not months: MA200, weekly/monthly swings and
 # weekly/monthly Fibo levels are meaningless on ~125 bars (the old 181 days).
@@ -167,10 +197,14 @@ def download_ohlc_to_csv(tickers, csv_filename, days=HISTORY_DAYS):
     return True
 
 
-def metrics_separate_tabs(tickers, procedure_choice, market_mappings):
+def metrics_separate_tabs(tickers, procedure_choice, market_mappings, min_dollar_volume=None):
     """
     Pobiera dane giełdowe, oblicza wskaźniki techniczne i zwraca oczyszczony DataFrame,
     gotowy do dalszego przetwarzania i serializacji JSON.
+
+    min_dollar_volume: if given, tickers whose median 50-day dollar volume is below it
+    are dropped (from the CSV and the metrics) and an 'avg_dollar_vol_50_m' column
+    (USD millions) is added.
     """
     print(f"Rozpoczynam pobieranie danych dla {len(tickers)} tickerów...")
 
@@ -198,6 +232,19 @@ def metrics_separate_tabs(tickers, procedure_choice, market_mappings):
     # (e.g. 'Close_AAPL'), sort columns and name the index 'Date'.
     if not tickers:
         return pd.DataFrame()
+
+    dollar_vol = None
+    if min_dollar_volume is not None and isinstance(tickers_data.columns, pd.MultiIndex):
+        dollar_vol = median_dollar_volume(tickers_data, tickers)
+        keep = dollar_vol[dollar_vol >= min_dollar_volume].index.tolist()
+        dropped = len(tickers) - len(keep)
+        print(f"Dollar-volume filter: dropped {dropped} of {len(tickers)} tickers below "
+              f"${min_dollar_volume / 1e6:.0f}M/day (median of {DOLLAR_VOLUME_DAYS} sessions), {len(keep)} kept.")
+        if not keep:
+            return pd.DataFrame()
+        tickers = keep
+        tickers_data = tickers_data.loc[:, tickers_data.columns.get_level_values(0).isin(keep)]
+
     ohlc_data = _flatten_ohlcv(tickers_data, tickers)
 
     # 5. Save data to the appropriate CSV file based on procedure_choice.
@@ -212,6 +259,10 @@ def metrics_separate_tabs(tickers, procedure_choice, market_mappings):
         print(f"Successfully exported all available daily OHLC data to {csv_filename}")
     elif procedure_choice in ["4", "7"]:
         csv_filename = "historical_prices_PROD.csv"
+        ohlc_data.to_csv(csv_filename)
+        print(f"Successfully exported all available daily OHLC data to {csv_filename}")
+    elif procedure_choice in ["3", "10"]:
+        csv_filename = "historical_prices_US.csv"
         ohlc_data.to_csv(csv_filename)
         print(f"Successfully exported all available daily OHLC data to {csv_filename}")
     elif procedure_choice in ["12"]:
@@ -313,6 +364,8 @@ def metrics_separate_tabs(tickers, procedure_choice, market_mappings):
             'DaysCloseAboveDMA25x5_Last30_': (close_prices.tail(30) > dma25x5.tail(30)).sum(),
             'pct_change_last': pct_change_last, # Dodanie nowej metryki do słownika
         }
+        if dollar_vol is not None:
+            results[ticker]['avg_dollar_vol_50_m'] = round(dollar_vol[ticker] / 1e6, 2)
 
     if not results:
         print("Nie udało się przetworzyć żadnych tickerów.")
@@ -363,7 +416,8 @@ def metrics_separate_tabs(tickers, procedure_choice, market_mappings):
         'DaysCloseAboveEMA50_Last30_', 'DaysCloseAboveSMA100_Last30_',
         'DaysCloseAboveEMA100_Last30_', 'DaysCloseAboveDMA25x5_Last30_',
         'market', 'market_real', 'tradingview_url', 'date',
-        'pct_change_last' # <-- Nowa metryka na samym końcu
+        'pct_change_last', # <-- Nowa metryka na samym końcu
+        'avg_dollar_vol_50_m',
     ]
     # --- KONIEC MODYFIKACJI 2 ---
 

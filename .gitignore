@@ -26,3 +26,5 @@ secrets.env
 secrets.env
 .env
 *secrets/
+#Graph dashboard disk cache (app/output/graph.py)
+*.graphcache.pkl
